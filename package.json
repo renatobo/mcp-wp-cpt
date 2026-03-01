@@ -1,7 +1,7 @@
 {
   "name": "@instawp/mcp-wp",
   "version": "0.0.3",
-  "description": "A Model Context Protocol server for interacting with WordPress.",
+  "description": "A Model Context Protocol server for WordPress with contract-driven custom content types.",
   "type": "module",
   "main": "./build/server.js",
   "exports": "./build/server.js",
@@ -15,6 +15,7 @@
     "build": "tsc --project tsconfig.json",
     "start": "node ./build/server.js",
     "dev": "tsx watch src/server.ts",
+    "test": "tsx --test test/*.test.ts",
     "clean": "rimraf build",
     "prepare": "npm run build"
   },
@@ -24,7 +25,9 @@
     "server",
     "claude",
     "ai",
-    "instawp"
+    "instawp",
+    "custom-post-types",
+    "eventon"
   ],
   "author": "Claude",
   "license": "GPL-3.0-or-later",

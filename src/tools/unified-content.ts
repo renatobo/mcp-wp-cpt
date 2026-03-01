@@ -2,41 +2,41 @@
 import { Tool } from '@modelcontextprotocol/sdk/types.js';
 import { makeWordPressRequest, logToFile } from '../wordpress.js';
 import { z } from 'zod';
+import { siteManager } from '../config/site-manager.js';
+import { listResolvedContentTypeContracts, resolveContentTypeContract } from '../adapters/registry.js';
+import { loadSiteManifests } from '../adapters/manifest-loader.js';
+import { describeContractExecution } from '../adapters/interpreter.js';
+import { formatContractError, prepareContentWriteRequest } from '../content/write-preparation.js';
+import { getContentEndpoint } from '../content/utils.js';
+import { ContractCompatibilityError, ContractValidationError } from '../adapters/types.js';
 
 // Cache for post types to reduce API calls
-let postTypesCache: any = null;
-let cacheTimestamp: number = 0;
+const postTypesCache = new Map<string, { value: any; timestamp: number }>();
 const CACHE_DURATION = 5 * 60 * 1000; // 5 minutes
 
 // Helper function to get all post types with caching
 async function getPostTypes(forceRefresh = false, siteId?: string) {
   const now = Date.now();
-  
-  if (!forceRefresh && postTypesCache && (now - cacheTimestamp) < CACHE_DURATION) {
+  const resolvedSiteId = siteManager.resolveSiteId(siteId);
+  const cacheEntry = postTypesCache.get(resolvedSiteId);
+
+  if (!forceRefresh && cacheEntry && (now - cacheEntry.timestamp) < CACHE_DURATION) {
     logToFile('Using cached post types');
-    return postTypesCache;
+    return cacheEntry.value;
   }
 
   try {
     logToFile('Fetching post types from API');
-    const response = await makeWordPressRequest('GET', 'types', undefined, { siteId });
-    postTypesCache = response;
-    cacheTimestamp = now;
+    const response = await makeWordPressRequest('GET', 'types', undefined, { siteId: resolvedSiteId });
+    postTypesCache.set(resolvedSiteId, {
+      value: response,
+      timestamp: now
+    });
     return response;
   } catch (error: any) {
     logToFile(`Error fetching post types: ${error.message}`);
     throw error;
   }
-}
-
-// Helper function to get the correct endpoint for a content type
-function getContentEndpoint(contentType: string): string {
-  const endpointMap: Record<string, string> = {
-    'post': 'posts',
-    'page': 'pages'
-  };
-  
-  return endpointMap[contentType] || contentType;
 }
 
 // Helper function to parse URL and extract slug and potential post type hints
@@ -126,7 +126,7 @@ const createContentSchema = z.object({
   content_type: z.string().describe("The content type slug"),
   site_id: z.string().optional().describe("Site ID (for multi-site setups)"),
   title: z.string().describe("Content title"),
-  content: z.string().describe("Content body"),
+  content: z.string().optional().describe("Content body"),
   status: z.string().optional().default('draft').describe("Content status"),
   excerpt: z.string().optional().describe("Content excerpt"),
   slug: z.string().optional().describe("Content slug"),
@@ -138,7 +138,8 @@ const createContentSchema = z.object({
   format: z.string().optional().describe("Content format"),
   menu_order: z.number().optional().describe("Menu order (for pages)"),
   meta: z.record(z.any()).optional().describe("Meta fields"),
-  custom_fields: z.record(z.any()).optional().describe("Custom fields specific to this content type")
+  custom_fields: z.record(z.any()).optional().describe("Custom fields specific to this content type"),
+  fields: z.record(z.any()).optional().describe("Structured contract-backed fields. Prefer this over custom_fields when describe_content_type reports preferred_write_mode=fields.")
 });
 
 const updateContentSchema = z.object({
@@ -158,7 +159,8 @@ const updateContentSchema = z.object({
   format: z.string().optional().describe("Content format"),
   menu_order: z.number().optional().describe("Menu order"),
   meta: z.record(z.any()).optional().describe("Meta fields"),
-  custom_fields: z.record(z.any()).optional().describe("Custom fields")
+  custom_fields: z.record(z.any()).optional().describe("Custom fields"),
+  fields: z.record(z.any()).optional().describe("Structured contract-backed fields. Prefer this over custom_fields when describe_content_type reports preferred_write_mode=fields.")
 });
 
 const deleteContentSchema = z.object({
@@ -170,6 +172,12 @@ const deleteContentSchema = z.object({
 
 const discoverContentTypesSchema = z.object({
   refresh_cache: z.boolean().optional().describe("Force refresh the content types cache"),
+  site_id: z.string().optional().describe("Site ID (for multi-site setups)")
+});
+
+const describeContentTypeSchema = z.object({
+  content_type: z.string().describe("The content type slug"),
+  refresh_cache: z.boolean().optional().describe("Force refresh the content type and manifest caches"),
   site_id: z.string().optional().describe("Site ID (for multi-site setups)")
 });
 
@@ -198,6 +206,7 @@ type CreateContentParams = z.infer<typeof createContentSchema>;
 type UpdateContentParams = z.infer<typeof updateContentSchema>;
 type DeleteContentParams = z.infer<typeof deleteContentSchema>;
 type DiscoverContentTypesParams = z.infer<typeof discoverContentTypesSchema>;
+type DescribeContentTypeParams = z.infer<typeof describeContentTypeSchema>;
 type FindContentByUrlParams = z.infer<typeof findContentByUrlSchema>;
 type GetContentBySlugParams = z.infer<typeof getContentBySlugSchema>;
 
@@ -231,6 +240,11 @@ export const unifiedContentTools: Tool[] = [
     name: "discover_content_types",
     description: "Discovers all available content types (built-in and custom) in the WordPress site",
     inputSchema: { type: "object", properties: discoverContentTypesSchema.shape }
+  },
+  {
+    name: "describe_content_type",
+    description: "Returns site-specific guidance, contract metadata, and any plugin-published contract for a content type",
+    inputSchema: { type: "object", properties: describeContentTypeSchema.shape }
   },
   {
     name: "find_content_by_url", 
@@ -303,41 +317,17 @@ export const unifiedContentHandlers = {
 
   create_content: async (params: CreateContentParams) => {
     try {
-      const endpoint = getContentEndpoint(params.content_type);
-      
-      const contentData: any = {
-        title: params.title,
-        content: params.content,
-        status: params.status,
-        excerpt: params.excerpt,
-        slug: params.slug,
-        author: params.author,
-        parent: params.parent,
-        featured_media: params.featured_media,
-        format: params.format,
-        menu_order: params.menu_order
-      };
-      
-      // Add post-specific fields
-      if (params.categories) contentData.categories = params.categories;
-      if (params.tags) contentData.tags = params.tags;
-      
-      // Add meta fields
-      if (params.meta) contentData.meta = params.meta;
-      
-      // Add custom fields
-      if (params.custom_fields) {
-        Object.assign(contentData, params.custom_fields);
-      }
-      
-      // Remove undefined values
-      Object.keys(contentData).forEach(key => {
-        if (contentData[key] === undefined) {
-          delete contentData[key];
-        }
+      const preparedRequest = await prepareContentWriteRequest({
+        operation: 'create',
+        contentType: params.content_type,
+        siteId: params.site_id,
+        input: params
       });
-      
-      const response = await makeWordPressRequest('POST', endpoint, contentData, { siteId: params.site_id });
+
+      const response = await makeWordPressRequest('POST', preparedRequest.endpoint, preparedRequest.data, {
+        siteId: params.site_id,
+        namespace: preparedRequest.namespace
+      });
       
       return {
         toolResult: {
@@ -349,11 +339,15 @@ export const unifiedContentHandlers = {
         }
       };
     } catch (error: any) {
+      const message = error instanceof ContractValidationError || error instanceof ContractCompatibilityError
+        ? formatContractError(error)
+        : `Error creating content: ${error.message}`;
+
       return {
         toolResult: {
           content: [{ 
             type: 'text', 
-            text: `Error creating content: ${error.message}` 
+            text: message 
           }],
           isError: true
         }
@@ -363,31 +357,22 @@ export const unifiedContentHandlers = {
 
   update_content: async (params: UpdateContentParams) => {
     try {
-      const endpoint = getContentEndpoint(params.content_type);
-      
-      const updateData: any = {};
-      
-      // Only include defined fields
-      if (params.title !== undefined) updateData.title = params.title;
-      if (params.content !== undefined) updateData.content = params.content;
-      if (params.status !== undefined) updateData.status = params.status;
-      if (params.excerpt !== undefined) updateData.excerpt = params.excerpt;
-      if (params.slug !== undefined) updateData.slug = params.slug;
-      if (params.author !== undefined) updateData.author = params.author;
-      if (params.parent !== undefined) updateData.parent = params.parent;
-      if (params.featured_media !== undefined) updateData.featured_media = params.featured_media;
-      if (params.format !== undefined) updateData.format = params.format;
-      if (params.menu_order !== undefined) updateData.menu_order = params.menu_order;
-      if (params.categories !== undefined) updateData.categories = params.categories;
-      if (params.tags !== undefined) updateData.tags = params.tags;
-      if (params.meta !== undefined) updateData.meta = params.meta;
-      
-      // Add custom fields
-      if (params.custom_fields) {
-        Object.assign(updateData, params.custom_fields);
-      }
-      
-      const response = await makeWordPressRequest('POST', `${endpoint}/${params.id}`, updateData, { siteId: params.site_id });
+      const preparedRequest = await prepareContentWriteRequest({
+        operation: 'update',
+        contentType: params.content_type,
+        siteId: params.site_id,
+        input: params
+      });
+
+      const response = await makeWordPressRequest(
+        'POST',
+        `${preparedRequest.endpoint}/${params.id}`,
+        preparedRequest.data,
+        {
+          siteId: params.site_id,
+          namespace: preparedRequest.namespace
+        }
+      );
       
       return {
         toolResult: {
@@ -399,11 +384,15 @@ export const unifiedContentHandlers = {
         }
       };
     } catch (error: any) {
+      const message = error instanceof ContractValidationError || error instanceof ContractCompatibilityError
+        ? formatContractError(error)
+        : `Error updating content: ${error.message}`;
+
       return {
         toolResult: {
           content: [{ 
             type: 'text', 
-            text: `Error updating content: ${error.message}` 
+            text: message 
           }],
           isError: true
         }
@@ -444,6 +433,7 @@ export const unifiedContentHandlers = {
   discover_content_types: async (params: DiscoverContentTypesParams) => {
     try {
       const contentTypes = await getPostTypes(params.refresh_cache || false, params.site_id);
+      const resolvedContracts = await listResolvedContentTypeContracts(params.site_id, params.refresh_cache || false);
       
       // Format the response to be more readable
       const formattedTypes = Object.entries(contentTypes).map(([slug, type]: [string, any]) => ({
@@ -453,7 +443,12 @@ export const unifiedContentHandlers = {
         rest_base: type.rest_base,
         hierarchical: type.hierarchical,
         supports: type.supports,
-        taxonomies: type.taxonomies
+        taxonomies: type.taxonomies,
+        has_extended_schema: resolvedContracts.some(({ contract, executable }) => contract.slug === slug && executable),
+        contract_source: resolvedContracts.find(({ contract, executable }) => contract.slug === slug && executable)?.manifest.source || null,
+        contract_provider: resolvedContracts.find(({ contract, executable }) => contract.slug === slug && executable)?.manifest.provider || null,
+        preferred_write_mode: resolvedContracts.find(({ contract, executable }) => contract.slug === slug && executable)?.contract.preferred_write_mode || null,
+        interpreter_ready: resolvedContracts.find(({ contract }) => contract.slug === slug)?.executable || false
       }));
       
       return {
@@ -471,6 +466,80 @@ export const unifiedContentHandlers = {
           content: [{ 
             type: 'text', 
             text: `Error discovering content types: ${error.message}` 
+          }],
+          isError: true
+        }
+      };
+    }
+  },
+
+  describe_content_type: async (params: DescribeContentTypeParams) => {
+    try {
+      const resolvedSiteId = siteManager.resolveSiteId(params.site_id);
+      const [contentTypes, contractResolution, manifestState] = await Promise.all([
+        getPostTypes(params.refresh_cache || false, resolvedSiteId),
+        resolveContentTypeContract(params.content_type, resolvedSiteId, params.refresh_cache || false),
+        loadSiteManifests(resolvedSiteId, params.refresh_cache || false)
+      ]);
+
+      const wordpressType = contentTypes[params.content_type];
+      const contractDescription =
+        contractResolution.contract && contractResolution.manifest
+          ? describeContractExecution(
+              contractResolution.contract,
+              contractResolution.manifest.provider,
+              contractResolution.manifest.schema_version,
+              contractResolution.executionSupport
+            )
+          : null;
+
+      const response = {
+        site_id: resolvedSiteId,
+        content_type: params.content_type,
+        wordpress: wordpressType
+          ? {
+              name: wordpressType.name,
+              description: wordpressType.description,
+              rest_base: wordpressType.rest_base,
+              hierarchical: wordpressType.hierarchical,
+              supports: wordpressType.supports,
+              taxonomies: wordpressType.taxonomies
+            }
+          : null,
+        contract: {
+          status: contractResolution.status,
+          has_extended_schema: contractResolution.status === 'supported',
+          interpreter_ready: contractResolution.executionSupport.executable,
+          message: contractResolution.message || null,
+          definition: contractResolution.contract || null,
+          source: contractResolution.manifest?.source || null,
+          provider: contractResolution.manifest?.provider || null,
+          description: contractDescription,
+          issues: contractResolution.issues,
+          execution_issues: contractResolution.executionSupport.issues
+        },
+        manifest_cache: {
+          fetched_at: manifestState.fetchedAt,
+          cache_hit: manifestState.cacheHit,
+          issues: manifestState.issues
+        }
+      };
+
+      return {
+        toolResult: {
+          content: [{
+            type: 'text',
+            text: JSON.stringify(response, null, 2)
+          }],
+          isError: false
+        }
+      };
+    } catch (error: any) {
+      return {
+        toolResult: {
+          content: [{
+            type: 'text',
+            text: `Error describing content type: ${error.message}`
           }],
           isError: true
         }

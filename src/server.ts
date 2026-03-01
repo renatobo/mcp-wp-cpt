@@ -54,8 +54,8 @@ for (const tool of allTools) {
     // const jsonSchema = zodToJsonSchema(z.object(tool.inputSchema.properties as z.ZodRawShape));
     // const parsedSchema = z.any().optional().parse(jsonSchema);
 
-    const zodSchema = z.object(tool.inputSchema.properties as z.ZodRawShape); 
-    server.tool(tool.name, zodSchema.shape, wrappedHandler)
+    const zodSchema = z.object(tool.inputSchema.properties as z.ZodRawShape);
+    server.tool(tool.name, zodSchema.shape as any, wrappedHandler as any);
 
 }
 

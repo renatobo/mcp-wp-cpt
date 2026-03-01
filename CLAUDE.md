@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-This is a WordPress MCP (Model Context Protocol) server that allows interaction with WordPress sites through natural language via MCP-compatible clients like Claude Desktop. The server exposes WordPress REST API functionality as MCP tools.
+This is a WordPress MCP (Model Context Protocol) server that allows interaction with WordPress sites through natural language via MCP-compatible clients like Claude Desktop. The server exposes WordPress REST API functionality as MCP tools and includes contract-driven support for plugin-published custom content type definitions such as EventON `ajde_events`.
 
 ## Development Commands
 
@@ -78,11 +78,17 @@ The app password can be generated from WordPress admin panel following the [Appl
    - Manages authenticated Axios instance for WordPress REST API calls
    - Integrates with SiteManager for multi-site support
    - Handles authentication using Basic Auth with application passwords
-   - Provides `makeWordPressRequest()` wrapper for all API calls with optional `siteId` parameter
+   - Provides `makeWordPressRequest()` wrapper for all API calls with optional `siteId` and `namespace` parameters
    - Includes logging to `logs/wordpress-api.log` for debugging
    - Special handler `searchWordPressPluginRepository()` for WordPress.org plugin search
 
-4. **Tool System (`src/tools/`)**: 
+4. **Contract System (`src/adapters/`)**:
+   - `manifest-loader.ts` discovers plugin-published contracts per site and caches them safely
+   - `registry.ts` resolves contracts for a content type at runtime
+   - `interpreter.ts` validates and normalizes structured fields from manifest rules
+   - Contracts are discovery-only; actual content writes still use the relevant `wp/v2` endpoint
+
+5. **Tool System (`src/tools/`)**: 
    - Each WordPress entity (posts, pages, media, etc.) has its own module
    - Each module exports tools array and handlers object
    - Tools use Zod schemas for input validation and type safety
@@ -123,7 +129,7 @@ export const entityHandlers = {
 
 The MCP server uses a **unified tool approach** to reduce complexity and tool count from ~65 to ~35 tools. Instead of separate tools for posts, pages, and custom post types, there are now unified tools that handle all content types.
 
-#### **Unified Content Tools** (`unified-content.ts`) - 8 tools
+#### **Unified Content Tools** (`unified-content.ts`) - 9 tools
 Handles ALL content types (posts, pages, custom post types) with a single set of tools:
 - `list_content` - List any content type with filtering and pagination
 - `get_content` - Get specific content by ID and type
@@ -131,6 +137,7 @@ Handles ALL content types (posts, pages, custom post types) with a single set of
 - `update_content` - Update existing content of any type
 - `delete_content` - Delete content of any type
 - `discover_content_types` - Find all available content types
+- `describe_content_type` - Return contract-backed guidance for a single content type
 - `find_content_by_url` - Smart URL resolver with optional update
 - `get_content_by_slug` - Search by slug across content types
 
@@ -184,6 +191,13 @@ All content operations use a single `content_type` parameter:
   "content_type": "documentation" // for custom post types
 }
 ```
+
+When a content type is contract-backed, `create_content` and `update_content` can also accept a structured `fields` object. The MCP workflow is:
+1. `discover_content_types`
+2. `describe_content_type`
+3. `create_content` or `update_content`
+
+For EventON APIfy, manifest discovery happens at `eventonapify/v1/mcp-schema`, while write operations still target `wp/v2/ajde_events`.
 
 #### Unified Taxonomy Management
 All taxonomy operations use a single `taxonomy` parameter:
@@ -240,6 +254,7 @@ The server integrates with Claude Desktop via the configuration in `claude_deskt
 
 - All API requests are wrapped in try-catch blocks
 - Errors are logged to `logs/wordpress-api.log` with full request/response details
+- Contract validation and compatibility failures are returned as explicit structured errors
 - Process signals (SIGTERM, SIGINT) are handled gracefully
 - Uncaught exceptions and rejections trigger proper shutdown
 
@@ -250,3 +265,8 @@ The server integrates with Claude Desktop via the configuration in `claude_deskt
 - `zod`: Runtime type validation for tool inputs
 - `dotenv`: Environment variable management
 - `tsx`: TypeScript execution for development
+
+## Testing
+
+- `npm test` runs the lightweight `node:test` suite through `tsx`
+- Coverage currently focuses on manifest caching, generic payload shaping, and contract-driven EventON validation/normalization

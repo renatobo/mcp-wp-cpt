@@ -4,7 +4,7 @@ import axios, { AxiosInstance, AxiosRequestConfig } from 'axios';
 import { siteManager } from './config/site-manager.js';
 
 // Legacy global WordPress API client instance for backward compatibility
-let wpClient: AxiosInstance;
+let wpClient: AxiosInstance | undefined;
 
 /**
  * Initialize the WordPress API client with authentication
@@ -22,6 +22,14 @@ export function logToFile(message: string) {
   return;
 }
 
+export interface WordPressRequestOptions {
+  headers?: Record<string, string>;
+  isFormData?: boolean;
+  rawResponse?: boolean;
+  siteId?: string;
+  namespace?: string;
+}
+
 /**
  * Make a request to the WordPress API
  * @param method HTTP method
@@ -34,17 +42,14 @@ export async function makeWordPressRequest(
   method: string, 
   endpoint: string, 
   data?: any, 
-  options?: {
-    headers?: Record<string, string>;
-    isFormData?: boolean;
-    rawResponse?: boolean;
-    siteId?: string;
-  }
+  options?: WordPressRequestOptions
 ) {
+  const namespace = options?.namespace || 'wp/v2';
+
   // Get the appropriate client for the site
   const client = options?.siteId 
-    ? await siteManager.getClient(options.siteId)
-    : (wpClient || await siteManager.getClient());
+    ? await siteManager.getClient(options.siteId, namespace)
+    : (wpClient && namespace === 'wp/v2' ? wpClient : await siteManager.getClient(undefined, namespace));
 
   // Log data (skip for FormData which can't be stringified)
   if (!options?.isFormData) {
@@ -83,6 +88,7 @@ REQUEST:
 URL: ${fullUrl}
 Method: ${method}
 Site: ${options?.siteId || 'default'}
+Namespace: ${namespace}
 Headers: ${JSON.stringify({...client.defaults.headers, ...requestConfig.headers}, null, 2)}
 Data: ${options?.isFormData ? '(FormData not shown)' : JSON.stringify(data, null, 2)}
 `;

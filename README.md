@@ -1,22 +1,193 @@
 # WordPress MCP Server
 
-This is a Model Context Protocol (MCP) server for WordPress, allowing you to interact with your WordPress site using natural language via an MCP-compatible client like Claude for Desktop. This server exposes various WordPress data and functionality as MCP tools.
+This is a Model Context Protocol (MCP) server for WordPress, allowing you to interact with your WordPress site using natural language via an MCP-compatible client like Claude for Desktop. This fork extends the base server with plugin-published content-type contracts so structured custom post types such as EventON `ajde_events` can expose machine-readable create and update guidance.
 
-## Usage 
+## Run Locally
 
-### Claude Desktop 
+This section is the recommended path if you want to run the server from this repository during development instead of using the published package.
 
-1. Download and install [Claude Desktop](https://claude.ai/download).
-2. Open Claude Desktop settings and navigate to the "Developer" tab.
-3. Copy the contents of the `claude_desktop_config.json.example` file.
-4. Click "Edit Config" to open the `claude_desktop_config.json` file.
-5. Copy paste the contents of the example file into the config file. Make sure to replace the placeholder values with your actual values for the WordPress site. To generate the application keys, follow this guide - [Application Passwords](https://make.wordpress.org/core/2020/11/05/application-passwords-integration-guide#Getting-Credentials).
-6. Save the configuration.
+### Prerequisites
+
+- Node.js 18 or newer
+- npm
+- A WordPress site with the REST API enabled
+- A WordPress user with an [Application Password](https://make.wordpress.org/core/2020/11/05/application-passwords-integration-guide#Getting-Credentials)
+- Claude Desktop if you want to use the server through an MCP client locally
+
+### 1. Clone the repository
+
+```bash
+git clone <repository_url>
+cd mcp-wp-cpt
+```
+
+If you already cloned it under a different directory name, use that directory instead.
+
+### 2. Install dependencies
+
+```bash
+npm install
+```
+
+This installs the runtime dependencies and the local development tools used by `npm run build`, `npm run dev`, and `npm test`.
+
+### 3. Create a local `.env`
+
+Create a `.env` file in the project root.
+
+Single-site example:
+
+```env
+WORDPRESS_API_URL=https://your-wordpress-site.com
+WORDPRESS_USERNAME=wp_username
+WORDPRESS_PASSWORD=your_application_password
+```
+
+Multi-site example:
+
+```env
+WORDPRESS_1_URL=https://production-site.com
+WORDPRESS_1_USERNAME=admin
+WORDPRESS_1_PASSWORD=app_password_1
+WORDPRESS_1_ID=production
+WORDPRESS_1_DEFAULT=true
+WORDPRESS_1_ALIASES=prod,main
+
+WORDPRESS_2_URL=https://staging-site.com
+WORDPRESS_2_USERNAME=admin
+WORDPRESS_2_PASSWORD=app_password_2
+WORDPRESS_2_ID=staging
+WORDPRESS_2_ALIASES=stage,dev
+```
+
+Notes:
+
+- Use either the single-site variables or the numbered multi-site variables.
+- `WORDPRESS_PASSWORD` and `WORDPRESS_N_PASSWORD` should be WordPress application passwords, not your normal login password.
+- If you include `/wp-json` or `/wp-json/wp/v2` in the site URL, keep it consistent. The server normalizes WordPress REST paths, but a clean site root URL is the safest input.
+
+### 4. Build the server
+
+```bash
+npm run build
+```
+
+This compiles TypeScript into `build/`.
+
+You should end up with:
+
+```text
+build/server.js
+```
+
+### 5. Run it directly from the terminal
+
+For a normal local run:
+
+```bash
+npm start
+```
+
+That runs:
+
+```bash
+node ./build/server.js
+```
+
+For local development with automatic reload on source changes:
+
+```bash
+npm run dev
+```
+
+That uses `tsx watch` and is useful while editing files in `src/`.
+
+### 6. Verify the local build before wiring it into an MCP client
+
+Recommended checks:
+
+```bash
+npm run build
+npm test
+```
+
+If startup fails immediately, the most common causes are:
+
+- missing `.env`
+- invalid WordPress URL
+- invalid application password
+- using the wrong username for the application password
+
+### 7. Connect Claude Desktop to the local build
+
+If you want Claude Desktop to use your local repository checkout instead of the published package:
+
+1. Install [Claude Desktop](https://claude.ai/download).
+2. Open Claude Desktop settings.
+3. Go to the `Developer` tab.
+4. Click `Edit Config`.
+5. Add a local MCP server entry that points to the absolute path of `build/server.js`.
+6. Save the config.
 7. Restart Claude Desktop.
+
+Start from [claude_desktop_config.json.example](./claude_desktop_config.json.example), but change the command so it runs your local build instead of `npx`.
+
+Example local config:
+
+```json
+{
+  "mcpServers": {
+    "wordpress": {
+      "command": "node",
+      "args": ["/absolute/path/to/mcp-wp-cpt/build/server.js"],
+      "env": {
+        "WORDPRESS_API_URL": "https://your-wordpress-site.com",
+        "WORDPRESS_USERNAME": "wp_username",
+        "WORDPRESS_PASSWORD": "your_application_password"
+      }
+    }
+  }
+}
+```
+
+For multi-site setups, use the numbered `WORDPRESS_N_*` environment variables in the same `env` block.
+
+### 8. Expected local workflow
+
+For everyday local development, this is usually enough:
+
+1. Update `.env`
+2. Run `npm install` once
+3. Run `npm run build`
+4. Run `npm test`
+5. Start the server with `npm start` or `npm run dev`
+6. Point Claude Desktop at `/absolute/path/to/mcp-wp-cpt/build/server.js`
+
+### Running the published package instead
+
+If you do not need local code changes, you can still run the published package with:
+
+```bash
+npx -y @instawp/mcp-wp
+```
+
+In that case, keep a `.env` file in your current working directory.
 
 ## Features
 
 This server provides tools to interact with core WordPress data and supports **multi-site management** - manage multiple WordPress sites from a single MCP server instance.
+
+## For Plugin Authors
+
+If you want your plugin to publish a custom content-type contract that this server can consume, start with [PLUGIN_CONTRACT_REQUIREMENTS.md](./PLUGIN_CONTRACT_REQUIREMENTS.md).
+
+That document defines:
+
+- the required manifest endpoint
+- the minimum contract shape
+- field and validation metadata
+- supported coercions and nested shapes
+- what makes a contract executable by the generic interpreter
 
 ### **Multi-Site Management** (3 tools)
 Manage multiple WordPress sites from a single MCP server:
@@ -27,7 +198,7 @@ Manage multiple WordPress sites from a single MCP server:
 
 All content and taxonomy tools support an optional `site_id` parameter to target specific sites.
 
-### **Unified Content Management** (8 tools)
+### **Unified Content Management** (9 tools)
 Handles ALL content types (posts, pages, custom post types) with a single set of intelligent tools:
 
 *   `list_content`: List any content type with filtering and pagination
@@ -36,6 +207,7 @@ Handles ALL content types (posts, pages, custom post types) with a single set of
 *   `update_content`: Update existing content of any type
 *   `delete_content`: Delete content of any type
 *   `discover_content_types`: Find all available content types on your site
+*   `describe_content_type`: Get site-specific contracts and preferred write guidance for a content type
 *   `find_content_by_url`: Smart URL resolver that can find and optionally update content from any WordPress URL
 *   `get_content_by_slug`: Search by slug across all content types
 
@@ -101,6 +273,54 @@ All content operations use a single `content_type` parameter:
 }
 ```
 
+#### Contract-Backed Content Types
+When a plugin publishes a manifest, `discover_content_types` marks the type with:
+- `has_extended_schema`
+- `contract_source`
+- `contract_provider`
+- `preferred_write_mode`
+- `interpreter_ready`
+
+For contract-backed content types, use `describe_content_type` before writing so the MCP client can inspect the contract, field list, validation rules, execution readiness, and examples returned by the site.
+
+The first contract exercised is EventON APIfy for `ajde_events`. Its manifest is discovered from `GET /wp-json/eventonapify/v1/mcp-schema`, while the actual content writes still go to `wp/v2/ajde_events`.
+
+Plugin authors should follow [PLUGIN_CONTRACT_REQUIREMENTS.md](./PLUGIN_CONTRACT_REQUIREMENTS.md) when publishing a manifest for this server.
+
+Example workflow:
+1. Run `discover_content_types` to find adapted content types.
+2. Run `describe_content_type` for the target type.
+3. Call `create_content` or `update_content` with a structured `fields` object.
+
+Example `create_content` payload for EventON:
+```json
+{
+  "content_type": "ajde_events",
+  "title": "Launch Party",
+  "status": "draft",
+  "fields": {
+    "start_date": "2026-04-01",
+    "start_time": "18:30",
+    "end_date": "2026-04-01",
+    "end_time": "20:30",
+    "timezone": "America/Los_Angeles",
+    "location": {
+      "name": "HQ"
+    },
+    "organizers": [
+      {
+        "name": "Team"
+      }
+    ],
+    "virtual": {
+      "enabled": false
+    }
+  }
+}
+```
+
+`custom_fields` still works for generic or legacy write flows, but `fields` is the preferred input when `describe_content_type` reports `preferred_write_mode: "fields"` and `interpreter_ready: true`.
+
 #### Universal Taxonomy Operations
 All taxonomy operations use a single `taxonomy` parameter:
 ```json
@@ -161,95 +381,30 @@ WORDPRESS_3_ID=development
 
 The server supports up to 10 sites. When using multi-site configuration, all tools accept an optional `site_id` parameter to target specific sites.
 
-## Using with npx and .env file
-
-You can run this MCP server directly using npx without installing it globally:
-
-```bash
-npx -y @instawp/mcp-wp
-```
-
-Make sure you have a `.env` file in your current directory with the configuration variables shown above.
+Contract manifests are cached per site, so multi-site setups can safely expose different plugin contracts. Use `refresh_cache: true` on `discover_content_types` or `describe_content_type` after plugin updates.
 
 ## Development
 
-### Prerequisites
+The main local setup instructions are in [Run Locally](#run-locally).
 
-*   **Node.js and npm:** Ensure you have Node.js (version 18 or higher) and npm installed.
-*   **WordPress Site:** You need an active WordPress site with the REST API enabled.
-*   **WordPress API Authentication:** Set up authentication for the WordPress REST API. This typically requires an authentication plugin or method (like Application Passwords).
-*   **MCP Client:** You need an application that can communicate with the MCP Server. Currently, Claude Desktop is recommended.
-
-### Installation and Setup
-
-1.  **Clone the Repository:**
-
-    ```bash
-    git clone <repository_url>
-    cd wordpress-mcp-server
-    ```
-
-2.  **Install Dependencies:**
-
-    ```bash
-    npm install
-    ```
-
-3.  **Create a `.env` file:**
-
-    Create a `.env` file in the root of your project directory and add your WordPress API credentials.
-    
-    For a single site:
-    ```env
-    WORDPRESS_API_URL=https://your-wordpress-site.com
-    WORDPRESS_USERNAME=wp_username
-    WORDPRESS_PASSWORD=wp_app_password
-    ```
-    
-    For multiple sites:
-    ```env
-    WORDPRESS_1_URL=https://site1.com
-    WORDPRESS_1_USERNAME=admin
-    WORDPRESS_1_PASSWORD=app_password_1
-    WORDPRESS_1_ID=site1
-    WORDPRESS_1_DEFAULT=true
-    
-    WORDPRESS_2_URL=https://site2.com
-    WORDPRESS_2_USERNAME=admin
-    WORDPRESS_2_PASSWORD=app_password_2
-    WORDPRESS_2_ID=site2
-    ```
-
-    Replace the placeholders with your actual values.
-
-4.  **Build the Server:**
-
-    ```bash
-    npm run build
-    ```
-
-5. **Configure Claude Desktop:**
-
-   * Open Claude Desktop settings and navigate to the "Developer" tab.
-   * Click "Edit Config" to open the `claude_desktop_config.json` file.
-   * Add a new server configuration under the `mcpServers` section. You will need to provide the **absolute** path to the `build/server.js` file and your WordPress environment variables.
-   * Save the configuration.
-
-### Running the Server
-
-Once you've configured Claude Desktop, the server should start automatically whenever Claude Desktop starts.
-
-You can also run the server directly from the command line for testing:
+Useful commands:
 
 ```bash
-npm start
-```
-
-or in development mode:
-
-```bash
+npm install
+npm run build
 npm run dev
+npm start
+npm test
+npm run clean
 ```
+
+## Contract Architecture
+
+- Reads and writes remain on the standard WordPress REST API, with `wp/v2` still used as the default namespace.
+- Plugin-specific discovery runs through namespace-aware requests, so the server can fetch manifest endpoints outside `wp/v2`.
+- Plugin contracts are cached per site and resolved at runtime.
+- `create_content` and `update_content` stay generic on the surface, but switch to contract-driven validation and normalization automatically when an executable contract exists.
+- If a structured write is attempted without a compatible executable contract, the server returns an explicit compatibility error instead of a generic WordPress failure.
 
 ### Security
 
