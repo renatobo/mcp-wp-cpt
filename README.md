@@ -321,6 +321,26 @@ Example `create_content` payload for EventON:
 
 `custom_fields` still works for generic or legacy write flows, but `fields` is the preferred input when `describe_content_type` reports `preferred_write_mode: "fields"` and `interpreter_ready: true`.
 
+#### Rank Math Focus Keyword Sync
+When the Rank Math plugin is active, content write tools now sync `rank_math_focus_keyword` through the Rank Math API:
+
+- `create_content`
+- `update_content`
+- `find_content_by_url` (when `update_fields` is provided)
+
+The server accepts focus keyword input from multiple shapes and normalizes it before syncing:
+
+- `meta.rank_math_focus_keyword`
+- top-level `rank_math_focus_keyword`
+- top-level `focus_keyword`
+- `custom_fields.rank_math_focus_keyword`
+- `custom_fields.focus_keyword`
+- `fields.rank_math_focus_keyword`
+- `fields.focus_keyword`
+
+If the plugin is inactive, or if plugin visibility is unavailable for the current credentials, content writes still succeed and Rank Math sync is skipped.
+If Rank Math sync fails after the content write, the tool response includes `_mcp_warnings` with the sync error while preserving the successful content result.
+
 #### Universal Taxonomy Operations
 All taxonomy operations use a single `taxonomy` parameter:
 ```json
@@ -404,6 +424,7 @@ npm run clean
 - Plugin-specific discovery runs through namespace-aware requests, so the server can fetch manifest endpoints outside `wp/v2`.
 - Plugin contracts are cached per site and resolved at runtime.
 - `create_content` and `update_content` stay generic on the surface, but switch to contract-driven validation and normalization automatically when an executable contract exists.
+- Rank Math focus keyword sync is detected per site and cached briefly to reduce plugin lookups during repeated writes.
 - If a structured write is attempted without a compatible executable contract, the server returns an explicit compatibility error instead of a generic WordPress failure.
 
 ### Security

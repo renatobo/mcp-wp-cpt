@@ -13,6 +13,7 @@ import { ContractCompatibilityError, ContractValidationError } from '../adapters
 // Cache for post types to reduce API calls
 const postTypesCache = new Map<string, { value: any; timestamp: number }>();
 const CACHE_DURATION = 5 * 60 * 1000; // 5 minutes
+const rankMathActiveCache = new Map<string, { value: boolean; timestamp: number }>();
 
 // Helper function to get all post types with caching
 async function getPostTypes(forceRefresh = false, siteId?: string) {
@@ -36,6 +37,42 @@ async function getPostTypes(forceRefresh = false, siteId?: string) {
   } catch (error: any) {
     logToFile(`Error fetching post types: ${error.message}`);
     throw error;
+  }
+}
+
+async function isRankMathActive(forceRefresh = false, siteId?: string): Promise<boolean> {
+  const now = Date.now();
+  const resolvedSiteId = siteManager.resolveSiteId(siteId);
+  const cacheEntry = rankMathActiveCache.get(resolvedSiteId);
+
+  if (!forceRefresh && cacheEntry && (now - cacheEntry.timestamp) < CACHE_DURATION) {
+    return cacheEntry.value;
+  }
+
+  try {
+    const response = await makeWordPressRequest('GET', 'plugins', { status: 'active' }, { siteId: resolvedSiteId });
+    const plugins = Array.isArray(response) ? response : [];
+
+    const active = plugins.some((plugin: any) => {
+      const pluginFile = typeof plugin?.plugin === 'string' ? plugin.plugin.toLowerCase() : '';
+      const pluginName = typeof plugin?.name === 'string' ? plugin.name.toLowerCase() : '';
+      const pluginTextDomain = typeof plugin?.textdomain === 'string' ? plugin.textdomain.toLowerCase() : '';
+
+      return (
+        pluginFile.includes('seo-by-rank-math') ||
+        pluginFile.includes('rank-math') ||
+        pluginName.includes('rank math') ||
+        pluginTextDomain === 'rank-math'
+      );
+    });
+
+    rankMathActiveCache.set(resolvedSiteId, { value: active, timestamp: now });
+    return active;
+  } catch (error: any) {
+    // If plugin visibility is unavailable (permissions/endpoints), fail closed and skip Rank Math sync.
+    logToFile(`Rank Math plugin status check failed; skipping sync: ${error.message}`);
+    rankMathActiveCache.set(resolvedSiteId, { value: false, timestamp: now });
+    return false;
   }
 }
 
@@ -210,6 +247,99 @@ type DescribeContentTypeParams = z.infer<typeof describeContentTypeSchema>;
 type FindContentByUrlParams = z.infer<typeof findContentByUrlSchema>;
 type GetContentBySlugParams = z.infer<typeof getContentBySlugSchema>;
 
+function normalizeFocusKeywordValue(value: unknown): string | undefined {
+  if (typeof value === 'string') {
+    const normalized = value.trim();
+    return normalized.length > 0 ? normalized : undefined;
+  }
+
+  if (Array.isArray(value)) {
+    const normalized = value
+      .map((entry) => (typeof entry === 'string' ? entry.trim() : String(entry).trim()))
+      .filter((entry) => entry.length > 0)
+      .join(',');
+
+    return normalized.length > 0 ? normalized : undefined;
+  }
+
+  return undefined;
+}
+
+function readFocusKeywordFromMeta(metaValue: unknown): string | undefined {
+  if (!metaValue || typeof metaValue !== 'object' || Array.isArray(metaValue)) {
+    return undefined;
+  }
+
+  const meta = metaValue as Record<string, unknown>;
+  return normalizeFocusKeywordValue(meta.rank_math_focus_keyword);
+}
+
+function readFocusKeywordForRankMathSync(
+  payload: Record<string, unknown>,
+  input: { meta?: Record<string, unknown>; custom_fields?: Record<string, unknown>; fields?: Record<string, unknown> }
+): string | undefined {
+  // Preferred source: explicit Rank Math meta in the outgoing payload.
+  const fromPayloadMeta = readFocusKeywordFromMeta(payload.meta);
+  if (fromPayloadMeta) {
+    return fromPayloadMeta;
+  }
+
+  // Structured contracts may map into top-level keys.
+  const fromPayloadRankMath = normalizeFocusKeywordValue(payload.rank_math_focus_keyword);
+  if (fromPayloadRankMath) {
+    return fromPayloadRankMath;
+  }
+
+  const fromPayloadFocusKeyword = normalizeFocusKeywordValue(payload.focus_keyword);
+  if (fromPayloadFocusKeyword) {
+    return fromPayloadFocusKeyword;
+  }
+
+  const fromInputMeta = readFocusKeywordFromMeta(input.meta);
+  if (fromInputMeta) {
+    return fromInputMeta;
+  }
+
+  const fromCustomFieldRankMath = normalizeFocusKeywordValue(input.custom_fields?.rank_math_focus_keyword);
+  if (fromCustomFieldRankMath) {
+    return fromCustomFieldRankMath;
+  }
+
+  const fromCustomFieldFocusKeyword = normalizeFocusKeywordValue(input.custom_fields?.focus_keyword);
+  if (fromCustomFieldFocusKeyword) {
+    return fromCustomFieldFocusKeyword;
+  }
+
+  const fromStructuredRankMath = normalizeFocusKeywordValue(input.fields?.rank_math_focus_keyword);
+  if (fromStructuredRankMath) {
+    return fromStructuredRankMath;
+  }
+
+  return normalizeFocusKeywordValue(input.fields?.focus_keyword);
+}
+
+async function syncRankMathFocusKeyword(
+  contentId: number,
+  focusKeyword: string,
+  siteId?: string
+): Promise<void> {
+  await makeWordPressRequest(
+    'POST',
+    'updateMeta',
+    {
+      objectType: 'post',
+      objectID: contentId,
+      meta: {
+        rank_math_focus_keyword: focusKeyword
+      }
+    },
+    {
+      siteId,
+      namespace: 'rankmath/v1'
+    }
+  );
+}
+
 export const unifiedContentTools: Tool[] = [
   {
     name: "list_content",
@@ -328,12 +458,34 @@ export const unifiedContentHandlers = {
         siteId: params.site_id,
         namespace: preparedRequest.namespace
       });
+
+      const warnings: string[] = [];
+      const focusKeyword = readFocusKeywordForRankMathSync(preparedRequest.data, params);
+      if (focusKeyword && response && typeof response === 'object' && typeof (response as any).id === 'number') {
+        const rankMathActive = await isRankMathActive(false, params.site_id);
+        if (rankMathActive) {
+          try {
+            await syncRankMathFocusKeyword((response as any).id, focusKeyword, params.site_id);
+          } catch (error: any) {
+            const message = `Rank Math focus keyword sync failed: ${error.message}`;
+            warnings.push(message);
+            logToFile(message);
+          }
+        } else {
+          logToFile('Rank Math plugin is not active; skipping focus keyword sync.');
+        }
+      }
+
+      const responseWithWarnings =
+        warnings.length > 0 && response && typeof response === 'object' && !Array.isArray(response)
+          ? { ...(response as Record<string, unknown>), _mcp_warnings: warnings }
+          : response;
       
       return {
         toolResult: {
           content: [{ 
             type: 'text', 
-            text: JSON.stringify(response, null, 2) 
+            text: JSON.stringify(responseWithWarnings, null, 2) 
           }],
           isError: false
         }
@@ -373,12 +525,34 @@ export const unifiedContentHandlers = {
           namespace: preparedRequest.namespace
         }
       );
+
+      const warnings: string[] = [];
+      const focusKeyword = readFocusKeywordForRankMathSync(preparedRequest.data, params);
+      if (focusKeyword) {
+        const rankMathActive = await isRankMathActive(false, params.site_id);
+        if (rankMathActive) {
+          try {
+            await syncRankMathFocusKeyword(params.id, focusKeyword, params.site_id);
+          } catch (error: any) {
+            const message = `Rank Math focus keyword sync failed: ${error.message}`;
+            warnings.push(message);
+            logToFile(message);
+          }
+        } else {
+          logToFile('Rank Math plugin is not active; skipping focus keyword sync.');
+        }
+      }
+
+      const responseWithWarnings =
+        warnings.length > 0 && response && typeof response === 'object' && !Array.isArray(response)
+          ? { ...(response as Record<string, unknown>), _mcp_warnings: warnings }
+          : response;
       
       return {
         toolResult: {
           content: [{ 
             type: 'text', 
-            text: JSON.stringify(response, null, 2) 
+            text: JSON.stringify(responseWithWarnings, null, 2) 
           }],
           isError: false
         }
@@ -613,6 +787,32 @@ export const unifiedContentHandlers = {
           }
           
           const updatedContent = await makeWordPressRequest('POST', `${endpoint}/${content.id}`, updateData, { siteId: params.site_id });
+          const warnings: string[] = [];
+          const focusKeyword = readFocusKeywordForRankMathSync(
+            updateData,
+            {
+              meta: params.update_fields.meta,
+              custom_fields: params.update_fields.custom_fields
+            }
+          );
+          if (focusKeyword) {
+            const rankMathActive = await isRankMathActive(false, params.site_id);
+            if (rankMathActive) {
+              try {
+                await syncRankMathFocusKeyword(content.id, focusKeyword, params.site_id);
+              } catch (error: any) {
+                const message = `Rank Math focus keyword sync failed: ${error.message}`;
+                warnings.push(message);
+                logToFile(message);
+              }
+            } else {
+              logToFile('Rank Math plugin is not active; skipping focus keyword sync.');
+            }
+          }
+          const updatedContentWithWarnings =
+            warnings.length > 0 && updatedContent && typeof updatedContent === 'object' && !Array.isArray(updatedContent)
+              ? { ...(updatedContent as Record<string, unknown>), _mcp_warnings: warnings }
+              : updatedContent;
           
           return {
             toolResult: {
@@ -624,7 +824,7 @@ export const unifiedContentHandlers = {
                   content_id: content.id,
                   original_url: params.url,
                   updated: true,
-                  content: updatedContent
+                  content: updatedContentWithWarnings
                 }, null, 2)
               }],
               isError: false
@@ -665,6 +865,32 @@ export const unifiedContentHandlers = {
         }
         
         const updatedContent = await makeWordPressRequest('POST', `${endpoint}/${content.id}`, updateData, { siteId: params.site_id });
+        const warnings: string[] = [];
+        const focusKeyword = readFocusKeywordForRankMathSync(
+          updateData,
+          {
+            meta: params.update_fields.meta,
+            custom_fields: params.update_fields.custom_fields
+          }
+        );
+        if (focusKeyword) {
+          const rankMathActive = await isRankMathActive(false, params.site_id);
+          if (rankMathActive) {
+            try {
+              await syncRankMathFocusKeyword(content.id, focusKeyword, params.site_id);
+            } catch (error: any) {
+              const message = `Rank Math focus keyword sync failed: ${error.message}`;
+              warnings.push(message);
+              logToFile(message);
+            }
+          } else {
+            logToFile('Rank Math plugin is not active; skipping focus keyword sync.');
+          }
+        }
+        const updatedContentWithWarnings =
+          warnings.length > 0 && updatedContent && typeof updatedContent === 'object' && !Array.isArray(updatedContent)
+            ? { ...(updatedContent as Record<string, unknown>), _mcp_warnings: warnings }
+            : updatedContent;
         
         return {
           toolResult: {
@@ -676,7 +902,7 @@ export const unifiedContentHandlers = {
                 content_id: content.id,
                 original_url: params.url,
                 updated: true,
-                content: updatedContent
+                content: updatedContentWithWarnings
               }, null, 2)
             }],
             isError: false
