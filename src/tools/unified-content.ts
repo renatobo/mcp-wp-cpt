@@ -8,6 +8,7 @@ import { loadSiteManifests } from '../adapters/manifest-loader.js';
 import { describeContractExecution } from '../adapters/interpreter.js';
 import { formatContractError, prepareContentWriteRequest } from '../content/write-preparation.js';
 import { getContentEndpoint } from '../content/utils.js';
+import { prepareListContentRequest } from '../content/read-preparation.js';
 import { ContractCompatibilityError, ContractValidationError } from '../adapters/types.js';
 
 // Cache for post types to reduce API calls
@@ -138,9 +139,11 @@ async function findContentAcrossTypes(slug: string, contentTypes?: string[], sit
 const listContentSchema = z.object({
   content_type: z.string().describe("The content type slug (e.g., 'post', 'page', 'product', 'documentation')"),
   site_id: z.string().optional().describe("Site ID (for multi-site setups)"),
+  event_id: z.union([z.number(), z.string()]).optional().describe("Parent event ID for contract-backed nested content types such as 'event_rsvps'"),
   page: z.number().optional().describe("Page number (default 1)"),
   per_page: z.number().min(1).max(100).optional().describe("Items per page (default 10, max 100)"),
   search: z.string().optional().describe("Search term for content title or body"),
+  rsvp: z.enum(['all', 'yes', 'no', 'maybe']).optional().describe("RSVP filter for contract-backed attendee content types such as 'event_rsvps'"),
   slug: z.string().optional().describe("Limit result to content with a specific slug"),
   status: z.string().optional().describe("Content status (publish, draft, etc.)"),
   author: z.union([z.number(), z.array(z.number())]).optional().describe("Author ID or array of IDs"),
@@ -151,7 +154,7 @@ const listContentSchema = z.object({
   order: z.enum(['asc', 'desc']).optional().describe("Order sort attribute"),
   after: z.string().optional().describe("ISO8601 date string to get content published after this date"),
   before: z.string().optional().describe("ISO8601 date string to get content published before this date")
-});
+}).passthrough();
 
 const getContentSchema = z.object({
   content_type: z.string().describe("The content type slug"),
@@ -391,10 +394,16 @@ export const unifiedContentTools: Tool[] = [
 export const unifiedContentHandlers = {
   list_content: async (params: ListContentParams) => {
     try {
-      const endpoint = getContentEndpoint(params.content_type);
-      const { content_type, site_id, ...queryParams } = params;
-      
-      const response = await makeWordPressRequest('GET', endpoint, queryParams, { siteId: site_id });
+      const preparedRequest = await prepareListContentRequest({
+        contentType: params.content_type,
+        siteId: params.site_id,
+        input: params
+      });
+
+      const response = await makeWordPressRequest('GET', preparedRequest.endpoint, preparedRequest.queryParams, {
+        siteId: params.site_id,
+        namespace: preparedRequest.namespace
+      });
       
       return {
         toolResult: {
@@ -406,11 +415,16 @@ export const unifiedContentHandlers = {
         }
       };
     } catch (error: any) {
+      const message =
+        error instanceof ContractCompatibilityError
+          ? formatContractError(error)
+          : `Error listing content: ${error.message}`;
+
       return {
         toolResult: {
           content: [{ 
             type: 'text', 
-            text: `Error listing content: ${error.message}` 
+            text: message
           }],
           isError: true
         }

@@ -46,5 +46,14 @@ export function splitNamespacedEndpoint(
     };
   }
 
+  if (parts.length >= 3 && /^v\d+/.test(parts[1])) {
+    const namespace = `${parts[0]}/${parts[1]}`;
+    const relativeEndpoint = parts.slice(2).join('/');
+    return {
+      namespace,
+      endpoint: relativeEndpoint || fallbackEndpoint
+    };
+  }
+
   return { endpoint: normalized || fallbackEndpoint };
 }

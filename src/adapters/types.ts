@@ -24,6 +24,12 @@ export interface ContentTypeFieldDefinition {
   [key: string]: unknown;
 }
 
+export interface ContentTypeParentContext {
+  content_type?: string;
+  id_param?: string;
+  [key: string]: unknown;
+}
+
 export interface ContentTypeContract {
   slug: string;
   label?: string;
@@ -31,6 +37,7 @@ export interface ContentTypeContract {
   preferred_endpoint?: string;
   preferred_write_mode?: string;
   supported_operations?: string[];
+  parent_context?: ContentTypeParentContext;
   fields?: ContentTypeFieldDefinition[];
   validation_rules?: Record<string, unknown>;
   examples?: Record<string, unknown>;

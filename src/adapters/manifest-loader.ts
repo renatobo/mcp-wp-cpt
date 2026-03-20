@@ -170,6 +170,7 @@ function normalizeContentTypeContract(entry: unknown, slugOverride?: string): Co
       coerceString(raw.write_mode) ||
       'fields',
     supported_operations: normalizeStringArray(raw.supported_operations ?? raw.operations),
+    parent_context: normalizeObject(raw.parent_context),
     fields: normalizeFields(raw.fields),
     validation_rules: normalizeObject(raw.validation_rules ?? raw.validation),
     examples: normalizeObject(raw.examples)
