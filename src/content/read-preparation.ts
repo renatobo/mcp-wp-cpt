@@ -3,7 +3,12 @@ import {
   ContractCompatibilityError,
   ContractResolution
 } from '../adapters/types.js';
-import { getContentEndpoint, removeUndefinedValues, splitNamespacedEndpoint } from './utils.js';
+import {
+  getContentEndpoint,
+  getDefensiveEndpointFallback,
+  removeUndefinedValues,
+  splitNamespacedEndpoint
+} from './utils.js';
 
 export interface PrepareListContentRequestArgs {
   contentType: string;
@@ -15,7 +20,27 @@ export interface PrepareListContentRequestArgs {
 export interface PreparedListContentRequest {
   endpoint: string;
   namespace?: string;
+  fallbackOn404?: {
+    endpoint: string;
+    namespace?: string;
+  };
   queryParams: Record<string, unknown>;
+  contractResolution: ContractResolution;
+}
+
+export interface PrepareGetContentRequestArgs {
+  contentType: string;
+  siteId?: string;
+  refreshCache?: boolean;
+}
+
+export interface PreparedGetContentRequest {
+  endpoint: string;
+  namespace?: string;
+  fallbackOn404?: {
+    endpoint: string;
+    namespace?: string;
+  };
   contractResolution: ContractResolution;
 }
 
@@ -39,6 +64,18 @@ export async function prepareListContentRequest(
   return buildListContentRequest(queryParams, contractResolution);
 }
 
+export async function prepareGetContentRequest(
+  args: PrepareGetContentRequestArgs
+): Promise<PreparedGetContentRequest> {
+  const contractResolution = await resolveContentTypeContract(
+    args.contentType,
+    args.siteId,
+    args.refreshCache
+  );
+
+  return buildGetContentRequest(contractResolution);
+}
+
 export function buildListContentRequest(
   queryParams: Record<string, unknown>,
   contractResolution: ContractResolution
@@ -52,7 +89,46 @@ export function buildListContentRequest(
 
   return {
     endpoint: getContentEndpoint(contractResolution.contentType),
+    fallbackOn404: getDefensiveEndpointFallback({
+      contentType: contractResolution.contentType,
+      provider: contractResolution.manifest?.provider,
+      endpoint: getContentEndpoint(contractResolution.contentType)
+    }),
     queryParams,
+    contractResolution
+  };
+}
+
+export function buildGetContentRequest(
+  contractResolution: ContractResolution
+): PreparedGetContentRequest {
+  if (canUseContractGetRequest(contractResolution)) {
+    const fallbackEndpoint = getContentEndpoint(contractResolution.contentType);
+    const split = splitNamespacedEndpoint(
+      contractResolution.contract?.preferred_endpoint,
+      fallbackEndpoint
+    );
+
+    return {
+      endpoint: split.endpoint,
+      namespace: split.namespace || contractResolution.manifest?.namespace,
+      fallbackOn404: getDefensiveEndpointFallback({
+        contentType: contractResolution.contentType,
+        provider: contractResolution.manifest?.provider,
+        endpoint: split.endpoint,
+        namespace: split.namespace || contractResolution.manifest?.namespace
+      }),
+      contractResolution
+    };
+  }
+
+  return {
+    endpoint: getContentEndpoint(contractResolution.contentType),
+    fallbackOn404: getDefensiveEndpointFallback({
+      contentType: contractResolution.contentType,
+      provider: contractResolution.manifest?.provider,
+      endpoint: getContentEndpoint(contractResolution.contentType)
+    }),
     contractResolution
   };
 }
@@ -64,6 +140,15 @@ export function canUseContractListRequest(contractResolution: ContractResolution
       contractResolution.manifest &&
       contractResolution.contract.preferred_endpoint &&
       contractResolution.contract.supported_operations?.includes('list')
+  );
+}
+
+export function canUseContractGetRequest(contractResolution: ContractResolution): boolean {
+  return Boolean(
+    contractResolution.contract &&
+      contractResolution.manifest &&
+      contractResolution.contract.preferred_endpoint &&
+      !contractResolution.contract.preferred_endpoint.includes('{')
   );
 }
 
@@ -86,6 +171,12 @@ export function buildContractListRequest(
   return {
     endpoint,
     namespace: split.namespace || contractResolution.manifest?.namespace,
+    fallbackOn404: getDefensiveEndpointFallback({
+      contentType: contractResolution.contentType,
+      provider: contractResolution.manifest?.provider,
+      endpoint,
+      namespace: split.namespace || contractResolution.manifest?.namespace
+    }),
     queryParams,
     contractResolution
   };

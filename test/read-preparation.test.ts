@@ -1,6 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { buildContractListRequest, buildListContentRequest } from '../src/content/read-preparation.js';
+import {
+  buildContractListRequest,
+  buildGetContentRequest,
+  buildListContentRequest
+} from '../src/content/read-preparation.js';
 import { splitNamespacedEndpoint } from '../src/content/utils.js';
 
 test('splitNamespacedEndpoint parses custom plugin namespaces', () => {
@@ -46,6 +50,35 @@ function getEventRsvpResolution(overrides: Record<string, unknown> = {}) {
   } as const;
 }
 
+function getEventResolution(overrides: Record<string, unknown> = {}) {
+  return {
+    siteId: 'staging',
+    contentType: 'ajde_events',
+    status: 'supported',
+    contract: {
+      slug: 'ajde_events',
+      preferred_endpoint: 'wp/v2/ajde_events',
+      preferred_write_mode: 'fields',
+      supported_operations: ['list', 'create', 'update']
+    },
+    manifest: {
+      provider: 'eventon-apify',
+      schema_version: '1.0.0',
+      namespace: 'eventonapify/v1',
+      endpoint: 'mcp-schema',
+      source: 'eventonapify/v1/mcp-schema',
+      contentTypes: [],
+      raw: {}
+    },
+    issues: [],
+    executionSupport: {
+      executable: true,
+      issues: []
+    },
+    ...overrides
+  } as const;
+}
+
 test('buildContractListRequest resolves contract-backed nested list endpoints', () => {
   const queryParams = {
     event_id: 14400,
@@ -59,6 +92,17 @@ test('buildContractListRequest resolves contract-backed nested list endpoints', 
   assert.deepEqual(prepared.queryParams, {
     per_page: 25,
     rsvp: 'yes'
+  });
+});
+
+test('buildGetContentRequest uses contract routes for direct content reads', () => {
+  const prepared = buildGetContentRequest(getEventResolution());
+
+  assert.equal(prepared.endpoint, 'ajde_events');
+  assert.equal(prepared.namespace, 'wp/v2');
+  assert.deepEqual(prepared.fallbackOn404, {
+    endpoint: 'events',
+    namespace: 'eventonapify/v1'
   });
 });
 

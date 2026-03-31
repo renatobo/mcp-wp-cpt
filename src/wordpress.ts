@@ -28,6 +28,10 @@ export interface WordPressRequestOptions {
   rawResponse?: boolean;
   siteId?: string;
   namespace?: string;
+  retry404With?: {
+    endpoint: string;
+    namespace?: string;
+  };
 }
 
 /**
@@ -105,6 +109,18 @@ Data: ${JSON.stringify(response.data, null, 2)}
     
     return options?.rawResponse ? response : response.data;
   } catch (error: any) {
+    if (axios.isAxiosError(error) && error.response?.status === 404 && options?.retry404With) {
+      logToFile(
+        `Retrying ${method} ${path} against fallback namespace ${options.retry404With.namespace || 'wp/v2'} endpoint ${options.retry404With.endpoint}`
+      );
+
+      return makeWordPressRequest(method, options.retry404With.endpoint, data, {
+        ...options,
+        namespace: options.retry404With.namespace,
+        retry404With: undefined
+      });
+    }
+
     const errorLog = `
 ERROR:
 Message: ${error.message}

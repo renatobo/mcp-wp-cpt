@@ -8,7 +8,7 @@ import {
   ContractValidationError,
   PreparedContentRequest
 } from '../adapters/types.js';
-import { getContentEndpoint } from './utils.js';
+import { getContentEndpoint, getDefensiveEndpointFallback } from './utils.js';
 import { buildBaseContentPayload } from './payloads.js';
 
 export interface PrepareContentWriteRequestArgs {
@@ -74,6 +74,11 @@ export async function prepareContentWriteRequest(
 
   return {
     endpoint: getContentEndpoint(args.contentType),
+    fallbackOn404: getDefensiveEndpointFallback({
+      contentType: args.contentType,
+      provider: contractResolution.manifest?.provider,
+      endpoint: getContentEndpoint(args.contentType)
+    }),
     data: buildBaseContentPayload(args.input, args.operation),
     contractResolution
   };

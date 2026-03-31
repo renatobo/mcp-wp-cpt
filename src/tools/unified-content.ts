@@ -8,7 +8,7 @@ import { loadSiteManifests } from '../adapters/manifest-loader.js';
 import { describeContractExecution } from '../adapters/interpreter.js';
 import { formatContractError, prepareContentWriteRequest } from '../content/write-preparation.js';
 import { getContentEndpoint } from '../content/utils.js';
-import { prepareListContentRequest } from '../content/read-preparation.js';
+import { prepareGetContentRequest, prepareListContentRequest } from '../content/read-preparation.js';
 import { ContractCompatibilityError, ContractValidationError } from '../adapters/types.js';
 
 // Cache for post types to reduce API calls
@@ -402,7 +402,8 @@ export const unifiedContentHandlers = {
 
       const response = await makeWordPressRequest('GET', preparedRequest.endpoint, preparedRequest.queryParams, {
         siteId: params.site_id,
-        namespace: preparedRequest.namespace
+        namespace: preparedRequest.namespace,
+        retry404With: preparedRequest.fallbackOn404
       });
       
       return {
@@ -434,8 +435,15 @@ export const unifiedContentHandlers = {
 
   get_content: async (params: GetContentParams) => {
     try {
-      const endpoint = getContentEndpoint(params.content_type);
-      const response = await makeWordPressRequest('GET', `${endpoint}/${params.id}`, undefined, { siteId: params.site_id });
+      const preparedRequest = await prepareGetContentRequest({
+        contentType: params.content_type,
+        siteId: params.site_id
+      });
+      const response = await makeWordPressRequest('GET', `${preparedRequest.endpoint}/${params.id}`, undefined, {
+        siteId: params.site_id,
+        namespace: preparedRequest.namespace,
+        retry404With: preparedRequest.fallbackOn404
+      });
       
       return {
         toolResult: {
@@ -470,7 +478,8 @@ export const unifiedContentHandlers = {
 
       const response = await makeWordPressRequest('POST', preparedRequest.endpoint, preparedRequest.data, {
         siteId: params.site_id,
-        namespace: preparedRequest.namespace
+        namespace: preparedRequest.namespace,
+        retry404With: preparedRequest.fallbackOn404
       });
 
       const warnings: string[] = [];
@@ -536,7 +545,8 @@ export const unifiedContentHandlers = {
         preparedRequest.data,
         {
           siteId: params.site_id,
-          namespace: preparedRequest.namespace
+          namespace: preparedRequest.namespace,
+          retry404With: preparedRequest.fallbackOn404
         }
       );
 

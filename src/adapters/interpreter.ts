@@ -1,5 +1,9 @@
 import { buildBaseContentPayload } from '../content/payloads.js';
-import { getContentEndpoint, splitNamespacedEndpoint } from '../content/utils.js';
+import {
+  getContentEndpoint,
+  getDefensiveEndpointFallback,
+  splitNamespacedEndpoint
+} from '../content/utils.js';
 import {
   AdaptedWriteInput,
   ContentTypeContract,
@@ -87,6 +91,12 @@ export function prepareContractWriteRequest(
   return {
     endpoint: endpointInfo.endpoint,
     namespace: endpointInfo.namespace,
+    fallbackOn404: getDefensiveEndpointFallback({
+      contentType: context.contentType,
+      provider: context.manifest.provider,
+      endpoint: endpointInfo.endpoint,
+      namespace: endpointInfo.namespace
+    }),
     data: payload,
     warnings: []
   };

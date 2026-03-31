@@ -111,6 +111,10 @@ test('contract interpreter validates and normalizes structured create input', ()
 
   assert.equal(prepared.endpoint, 'ajde_events');
   assert.equal(prepared.namespace, 'wp/v2');
+  assert.deepEqual(prepared.fallbackOn404, {
+    endpoint: 'events',
+    namespace: 'eventonapify/v1'
+  });
   assert.equal(prepared.data.title, 'Launch Party');
   assert.equal(prepared.data.status, 'draft');
   assert.equal(prepared.data.legacy_flag, true);

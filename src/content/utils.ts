@@ -57,3 +57,27 @@ export function splitNamespacedEndpoint(
 
   return { endpoint: normalized || fallbackEndpoint };
 }
+
+export function getDefensiveEndpointFallback(args: {
+  contentType: string;
+  provider?: string;
+  endpoint: string;
+  namespace?: string;
+}): { endpoint: string; namespace?: string } | undefined {
+  const namespace = args.namespace || 'wp/v2';
+  const endpoint = args.endpoint.replace(/^\/+|\/+$/g, '');
+
+  if (
+    args.provider === 'eventon-apify' &&
+    args.contentType === 'ajde_events' &&
+    namespace === 'wp/v2' &&
+    endpoint === 'ajde_events'
+  ) {
+    return {
+      endpoint: 'events',
+      namespace: 'eventonapify/v1'
+    };
+  }
+
+  return undefined;
+}

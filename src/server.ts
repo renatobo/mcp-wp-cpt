@@ -13,7 +13,7 @@ import { zodToJsonSchema } from 'zod-to-json-schema';
 // Create MCP server instance
 const server = new McpServer({
     name: "wordpress",
-    version: "0.0.1"
+    version: "0.0.4"
 }, {
     capabilities: {
         tools: allTools.reduce((acc, tool) => {

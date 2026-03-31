@@ -103,6 +103,10 @@ export interface ContractInterpreterContext {
 export interface PreparedContentRequest {
   endpoint: string;
   namespace?: string;
+  fallbackOn404?: {
+    endpoint: string;
+    namespace?: string;
+  };
   data: Record<string, unknown>;
   warnings?: string[];
 }
