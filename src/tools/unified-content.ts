@@ -177,9 +177,9 @@ const createContentSchema = z.object({
   featured_media: z.number().optional().describe("Featured image ID"),
   format: z.string().optional().describe("Content format"),
   menu_order: z.number().optional().describe("Menu order (for pages)"),
-  meta: z.record(z.any()).optional().describe("Meta fields"),
-  custom_fields: z.record(z.any()).optional().describe("Custom fields specific to this content type"),
-  fields: z.record(z.any()).optional().describe("Structured contract-backed fields. Prefer this over custom_fields when describe_content_type reports preferred_write_mode=fields.")
+  meta: z.record(z.string(), z.any()).optional().describe("Meta fields"),
+  custom_fields: z.record(z.string(), z.any()).optional().describe("Custom fields specific to this content type"),
+  fields: z.record(z.string(), z.any()).optional().describe("Structured contract-backed fields. Prefer this over custom_fields when describe_content_type reports preferred_write_mode=fields.")
 });
 
 const updateContentSchema = z.object({
@@ -198,9 +198,9 @@ const updateContentSchema = z.object({
   featured_media: z.number().optional().describe("Featured image ID"),
   format: z.string().optional().describe("Content format"),
   menu_order: z.number().optional().describe("Menu order"),
-  meta: z.record(z.any()).optional().describe("Meta fields"),
-  custom_fields: z.record(z.any()).optional().describe("Custom fields"),
-  fields: z.record(z.any()).optional().describe("Structured contract-backed fields. Prefer this over custom_fields when describe_content_type reports preferred_write_mode=fields.")
+  meta: z.record(z.string(), z.any()).optional().describe("Meta fields"),
+  custom_fields: z.record(z.string(), z.any()).optional().describe("Custom fields"),
+  fields: z.record(z.string(), z.any()).optional().describe("Structured contract-backed fields. Prefer this over custom_fields when describe_content_type reports preferred_write_mode=fields.")
 });
 
 const deleteContentSchema = z.object({
@@ -228,8 +228,8 @@ const findContentByUrlSchema = z.object({
     title: z.string().optional(),
     content: z.string().optional(),
     status: z.string().optional(),
-    meta: z.record(z.any()).optional(),
-    custom_fields: z.record(z.any()).optional()
+    meta: z.record(z.string(), z.any()).optional(),
+    custom_fields: z.record(z.string(), z.any()).optional()
   }).optional().describe("Optional fields to update after finding the content")
 });
 

@@ -27,7 +27,7 @@ const deactivatePluginSchema = z.object({
 }).strict();
 
 const createPluginSchema = z.object({
-  slug: z.string({ required_error: "Plugin slug is required" }).describe("WordPress.org plugin directory slug, e.g., 'akismet', 'elementor', 'wordpress-seo'"),
+  slug: z.string({ error: "Plugin slug is required" }).describe("WordPress.org plugin directory slug, e.g., 'akismet', 'elementor', 'wordpress-seo'"),
   status: z.enum(['inactive', 'active']).optional().default('active').describe("Plugin activation status")
 }).strict();
 
