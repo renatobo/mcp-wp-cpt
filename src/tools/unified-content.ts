@@ -139,7 +139,7 @@ async function findContentAcrossTypes(slug: string, contentTypes?: string[], sit
 const listContentSchema = z.object({
   content_type: z.string().describe("The content type slug (e.g., 'post', 'page', 'product', 'documentation')"),
   site_id: z.string().optional().describe("Site ID (for multi-site setups)"),
-  event_id: z.union([z.number(), z.string()]).optional().describe("Parent event ID for contract-backed nested content types such as 'event_rsvps'"),
+  event_id: z.number().optional().describe("Parent event ID for contract-backed nested content types such as 'event_rsvps'"),
   page: z.number().optional().describe("Page number (default 1)"),
   per_page: z.number().min(1).max(100).optional().describe("Items per page (default 10, max 100)"),
   search: z.string().optional().describe("Search term for content title or body"),
@@ -634,6 +634,7 @@ export const unifiedContentHandlers = {
       const resolvedContracts = await listResolvedContentTypeContracts(params.site_id, params.refresh_cache || false);
       
       // Format the response to be more readable
+      const restSlugs = new Set(Object.keys(contentTypes));
       const formattedTypes = Object.entries(contentTypes).map(([slug, type]: [string, any]) => ({
         slug,
         name: type.name,
@@ -648,6 +649,26 @@ export const unifiedContentHandlers = {
         preferred_write_mode: resolvedContracts.find(({ contract, executable }) => contract.slug === slug && executable)?.contract.preferred_write_mode || null,
         interpreter_ready: resolvedContracts.find(({ contract }) => contract.slug === slug)?.executable || false
       }));
+
+      // Append contract-only types not visible in the REST API (e.g. show_in_rest = false)
+      for (const { contract, manifest, executable } of resolvedContracts) {
+        if (!restSlugs.has(contract.slug)) {
+          formattedTypes.push({
+            slug: contract.slug,
+            name: contract.label || contract.slug,
+            description: contract.description || `Contract-backed content type (${manifest.provider})`,
+            rest_base: contract.slug,
+            hierarchical: false,
+            supports: [],
+            taxonomies: [],
+            has_extended_schema: executable,
+            contract_source: manifest.source || null,
+            contract_provider: manifest.provider || null,
+            preferred_write_mode: contract.preferred_write_mode || null,
+            interpreter_ready: executable
+          });
+        }
+      }
       
       return {
         toolResult: {
