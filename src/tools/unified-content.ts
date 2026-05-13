@@ -2,6 +2,10 @@
 import { Tool } from '@modelcontextprotocol/sdk/types.js';
 import { makeWordPressRequest, logToFile } from '../wordpress.js';
 import { z } from 'zod';
+import * as fs from 'fs-extra';
+import * as path from 'path';
+import * as os from 'os';
+import { marked } from 'marked';
 import { siteManager } from '../config/site-manager.js';
 import { listResolvedContentTypeContracts, resolveContentTypeContract } from '../adapters/registry.js';
 import { loadSiteManifests } from '../adapters/manifest-loader.js';
@@ -11,10 +15,44 @@ import { getContentEndpoint } from '../content/utils.js';
 import { prepareGetContentRequest, prepareListContentRequest } from '../content/read-preparation.js';
 import { ContractCompatibilityError, ContractValidationError } from '../adapters/types.js';
 
+const CACHE_DIR = process.env.UNIFIED_CONTENT_CACHE_DIR
+  ? path.resolve(process.env.UNIFIED_CONTENT_CACHE_DIR)
+  : path.join(os.tmpdir(), 'mcp-wp', '.cache');
+
+fs.ensureDir(CACHE_DIR).catch(() => {});
+
 // Cache for post types to reduce API calls
 const postTypesCache = new Map<string, { value: any; timestamp: number }>();
-const CACHE_DURATION = 5 * 60 * 1000; // 5 minutes
+const CACHE_DURATION = parseInt(process.env.WORDPRESS_CACHE_DURATION || `${5 * 60 * 1000}`, 10);
 const rankMathActiveCache = new Map<string, { value: boolean; timestamp: number }>();
+
+async function loadCacheFromDisk(siteId: string): Promise<{ data: any; timestamp: number } | null> {
+  try {
+    await fs.ensureDir(CACHE_DIR);
+    const cacheFilePath = path.join(CACHE_DIR, `content-types-${siteId}.json`);
+
+    if (await fs.pathExists(cacheFilePath)) {
+      return await fs.readJson(cacheFilePath);
+    }
+  } catch (error) {
+    logToFile(`Failed to load content type cache from disk: ${error}`, 'debug');
+  }
+
+  return null;
+}
+
+async function saveCacheToDisk(siteId: string, data: any): Promise<void> {
+  try {
+    await fs.ensureDir(CACHE_DIR);
+    const cacheFilePath = path.join(CACHE_DIR, `content-types-${siteId}.json`);
+    await fs.writeJson(cacheFilePath, {
+      data,
+      timestamp: Date.now()
+    });
+  } catch (error) {
+    logToFile(`Failed to save content type cache to disk: ${error}`, 'debug');
+  }
+}
 
 // Helper function to get all post types with caching
 async function getPostTypes(forceRefresh = false, siteId?: string) {
@@ -23,20 +61,33 @@ async function getPostTypes(forceRefresh = false, siteId?: string) {
   const cacheEntry = postTypesCache.get(resolvedSiteId);
 
   if (!forceRefresh && cacheEntry && (now - cacheEntry.timestamp) < CACHE_DURATION) {
-    logToFile('Using cached post types');
+    logToFile('Using memory-cached post types', 'debug');
     return cacheEntry.value;
   }
 
+  if (!forceRefresh) {
+    const diskCache = await loadCacheFromDisk(resolvedSiteId);
+    if (diskCache && (now - diskCache.timestamp) < CACHE_DURATION) {
+      logToFile('Using disk-cached post types', 'debug');
+      postTypesCache.set(resolvedSiteId, {
+        value: diskCache.data,
+        timestamp: diskCache.timestamp
+      });
+      return diskCache.data;
+    }
+  }
+
   try {
-    logToFile('Fetching post types from API');
+    logToFile('Fetching post types from API', 'info');
     const response = await makeWordPressRequest('GET', 'types', undefined, { siteId: resolvedSiteId });
     postTypesCache.set(resolvedSiteId, {
       value: response,
       timestamp: now
     });
+    await saveCacheToDisk(resolvedSiteId, response);
     return response;
   } catch (error: any) {
-    logToFile(`Error fetching post types: ${error.message}`);
+    logToFile(`Error fetching post types: ${error.message}`, 'error');
     throw error;
   }
 }
@@ -111,28 +162,217 @@ async function findContentAcrossTypes(slug: string, contentTypes?: string[], sit
     ));
   }
   
-  logToFile(`Searching for slug "${slug}" across content types: ${typesToSearch.join(', ')}`);
-  
-  // Search each content type for the slug
-  for (const contentType of typesToSearch) {
+  logToFile(`Searching for slug "${slug}" across content types: ${typesToSearch.join(', ')}`, 'debug');
+
+  const searchOne = async (contentType: string) => {
     try {
       const endpoint = getContentEndpoint(contentType);
-      
+
       const response = await makeWordPressRequest('GET', endpoint, {
-        slug: slug,
+        slug,
         per_page: 1
       }, { siteId });
-      
+
       if (Array.isArray(response) && response.length > 0) {
-        logToFile(`Found content with slug "${slug}" in content type "${contentType}"`);
+        logToFile(`Found content with slug "${slug}" in content type "${contentType}"`, 'info');
         return { content: response[0], contentType };
       }
     } catch (error) {
-      logToFile(`Error searching ${contentType}: ${error}`);
+      logToFile(`Error searching ${contentType}: ${error}`, 'debug');
+    }
+
+    return null;
+  };
+
+  if (process.env.WORDPRESS_PARALLEL_SEARCH !== 'false' && typesToSearch.length > 1) {
+    const results = await Promise.all(typesToSearch.map(searchOne));
+    const found = results.find((result) => result !== null);
+    if (found) {
+      return found;
+    }
+
+    return null;
+  }
+
+  for (const contentType of typesToSearch) {
+    const result = await searchOne(contentType);
+    if (result) {
+      return result;
     }
   }
   
   return null;
+}
+
+type ContentFormat = 'auto' | 'markdown' | 'html' | 'blocks';
+type DetectedFormat = 'blocks' | 'html' | 'markdown' | 'text';
+
+function detectContentFormat(content: string): DetectedFormat {
+  if (/<!--\s*wp:/.test(content)) {
+    return 'blocks';
+  }
+
+  if (/<[a-z][\s\S]*>/i.test(content)) {
+    return 'html';
+  }
+
+  const markdownPatterns = [
+    /^#{1,6}\s+/m,
+    /\*\*[^*]+\*\*/,
+    /\*[^*]+\*/,
+    /\[[^\]]+\]\([^)]+\)/,
+    /^[-*+]\s+/m,
+    /^\d+\.\s+/m,
+    /^>\s+/m,
+    /`[^`]+`/,
+    /^```/m,
+    /!\[[^\]]*\]\([^)]+\)/,
+    /^---$/m,
+    /^\|.*\|$/m
+  ];
+
+  return markdownPatterns.some((pattern) => pattern.test(content)) ? 'markdown' : 'text';
+}
+
+async function convertMarkdownToHtml(markdown: string): Promise<string> {
+  try {
+    return await marked(markdown, {
+      gfm: true,
+      breaks: false
+    });
+  } catch (error) {
+    logToFile(`Error converting markdown to HTML: ${error}`, 'error');
+    throw error;
+  }
+}
+
+function convertHtmlToBlocks(html: string): string {
+  const blocks: string[] = [];
+  const blockRegex = /<(p|h[1-6]|ul|ol|blockquote|pre|table|hr|div)[^>]*>[\s\S]*?<\/\1>|<(hr|br)\s*\/?>/gi;
+  let match;
+  let lastIndex = 0;
+
+  while ((match = blockRegex.exec(html)) !== null) {
+    const textBefore = html.slice(lastIndex, match.index).trim();
+    if (textBefore) {
+      blocks.push(`<!-- wp:paragraph -->\n<p>${textBefore}</p>\n<!-- /wp:paragraph -->`);
+    }
+
+    const element = match[0];
+    const tagName = (match[1] || match[2] || '').toLowerCase();
+
+    switch (tagName) {
+      case 'p':
+        blocks.push(`<!-- wp:paragraph -->\n${element}\n<!-- /wp:paragraph -->`);
+        break;
+      case 'h1':
+        blocks.push(`<!-- wp:heading {"level":1} -->\n${element}\n<!-- /wp:heading -->`);
+        break;
+      case 'h2':
+        blocks.push(`<!-- wp:heading -->\n${element}\n<!-- /wp:heading -->`);
+        break;
+      case 'h3':
+        blocks.push(`<!-- wp:heading {"level":3} -->\n${element}\n<!-- /wp:heading -->`);
+        break;
+      case 'h4':
+        blocks.push(`<!-- wp:heading {"level":4} -->\n${element}\n<!-- /wp:heading -->`);
+        break;
+      case 'h5':
+        blocks.push(`<!-- wp:heading {"level":5} -->\n${element}\n<!-- /wp:heading -->`);
+        break;
+      case 'h6':
+        blocks.push(`<!-- wp:heading {"level":6} -->\n${element}\n<!-- /wp:heading -->`);
+        break;
+      case 'ul':
+        blocks.push(`<!-- wp:list -->\n${element}\n<!-- /wp:list -->`);
+        break;
+      case 'ol':
+        blocks.push(`<!-- wp:list {"ordered":true} -->\n${element}\n<!-- /wp:list -->`);
+        break;
+      case 'blockquote':
+        blocks.push(`<!-- wp:quote -->\n${element}\n<!-- /wp:quote -->`);
+        break;
+      case 'pre':
+        blocks.push(`<!-- wp:code -->\n${element}\n<!-- /wp:code -->`);
+        break;
+      case 'table':
+        blocks.push(`<!-- wp:table -->\n<figure class="wp-block-table">${element}</figure>\n<!-- /wp:table -->`);
+        break;
+      case 'hr':
+        blocks.push(`<!-- wp:separator -->\n<hr class="wp-block-separator has-alpha-channel-opacity"/>\n<!-- /wp:separator -->`);
+        break;
+      default:
+        blocks.push(`<!-- wp:paragraph -->\n${element}\n<!-- /wp:paragraph -->`);
+    }
+
+    lastIndex = match.index + match[0].length;
+  }
+
+  const remaining = html.slice(lastIndex).trim();
+  if (remaining) {
+    blocks.push(`<!-- wp:paragraph -->\n<p>${remaining}</p>\n<!-- /wp:paragraph -->`);
+  }
+
+  if (blocks.length === 0 && html.trim()) {
+    return `<!-- wp:paragraph -->\n<p>${html}</p>\n<!-- /wp:paragraph -->`;
+  }
+
+  return blocks.join('\n\n');
+}
+
+async function processContent(
+  content: string,
+  format: ContentFormat = 'auto',
+  convertToBlocks = false
+): Promise<string> {
+  if (!content || !content.trim()) {
+    return content;
+  }
+
+  const detectedFormat =
+    format === 'auto'
+      ? detectContentFormat(content)
+      : format === 'blocks'
+        ? 'blocks'
+        : format === 'html'
+          ? 'html'
+          : format === 'markdown'
+            ? 'markdown'
+            : 'text';
+
+  logToFile(`Content format: ${detectedFormat}`, 'debug');
+
+  if (detectedFormat === 'blocks') {
+    return content;
+  }
+
+  let htmlContent: string;
+  if (detectedFormat === 'markdown') {
+    htmlContent = await convertMarkdownToHtml(content);
+  } else if (detectedFormat === 'html') {
+    htmlContent = content;
+  } else {
+    htmlContent = `<p>${content.replace(/\n\n/g, '</p>\n<p>').replace(/\n/g, '<br>')}</p>`;
+  }
+
+  return convertToBlocks ? convertHtmlToBlocks(htmlContent) : htmlContent;
+}
+
+async function processWriteContent<T extends { content?: string; content_format?: ContentFormat; convert_to_blocks?: boolean }>(
+  input: T
+): Promise<T> {
+  if (input.content === undefined) {
+    return input;
+  }
+
+  return {
+    ...input,
+    content: await processContent(
+      input.content,
+      input.content_format || 'auto',
+      input.convert_to_blocks || false
+    )
+  };
 }
 
 // Schema definitions
@@ -166,7 +406,15 @@ const createContentSchema = z.object({
   content_type: z.string().describe("The content type slug"),
   site_id: z.string().optional().describe("Site ID (for multi-site setups)"),
   title: z.string().describe("Content title"),
-  content: z.string().optional().describe("Content body"),
+  content: z.string().optional().describe(
+    "Content body. Accepts Gutenberg blocks, HTML, or Markdown. Markdown is auto-converted to HTML when detected."
+  ),
+  content_format: z.enum(['auto', 'markdown', 'html', 'blocks']).optional().default('auto').describe(
+    "Content format hint: 'auto' (detect and convert), 'markdown', 'html', or 'blocks' (Gutenberg)"
+  ),
+  convert_to_blocks: z.boolean().optional().default(false).describe(
+    "Convert content to Gutenberg blocks. Recommended for sites using block editor."
+  ),
   status: z.string().optional().default('draft').describe("Content status"),
   excerpt: z.string().optional().describe("Content excerpt"),
   slug: z.string().optional().describe("Content slug"),
@@ -175,7 +423,7 @@ const createContentSchema = z.object({
   categories: z.array(z.number()).optional().describe("Array of category IDs (for posts)"),
   tags: z.array(z.number()).optional().describe("Array of tag IDs (for posts)"),
   featured_media: z.number().optional().describe("Featured image ID"),
-  format: z.string().optional().describe("Content format"),
+  format: z.string().optional().describe("Post format (standard, aside, gallery, etc.)"),
   menu_order: z.number().optional().describe("Menu order (for pages)"),
   meta: z.record(z.string(), z.any()).optional().describe("Meta fields"),
   custom_fields: z.record(z.string(), z.any()).optional().describe("Custom fields specific to this content type"),
@@ -187,7 +435,15 @@ const updateContentSchema = z.object({
   id: z.number().describe("Content ID"),
   site_id: z.string().optional().describe("Site ID (for multi-site setups)"),
   title: z.string().optional().describe("Content title"),
-  content: z.string().optional().describe("Content body"),
+  content: z.string().optional().describe(
+    "Content body. Accepts Gutenberg blocks, HTML, or Markdown. Markdown is auto-converted to HTML when detected."
+  ),
+  content_format: z.enum(['auto', 'markdown', 'html', 'blocks']).optional().default('auto').describe(
+    "Content format hint: 'auto' (detect and convert), 'markdown', 'html', or 'blocks' (Gutenberg)"
+  ),
+  convert_to_blocks: z.boolean().optional().default(false).describe(
+    "Convert content to Gutenberg blocks. Recommended for sites using block editor."
+  ),
   status: z.string().optional().describe("Content status"),
   excerpt: z.string().optional().describe("Content excerpt"),
   slug: z.string().optional().describe("Content slug"),
@@ -196,7 +452,7 @@ const updateContentSchema = z.object({
   categories: z.array(z.number()).optional().describe("Array of category IDs"),
   tags: z.array(z.number()).optional().describe("Array of tag IDs"),
   featured_media: z.number().optional().describe("Featured image ID"),
-  format: z.string().optional().describe("Content format"),
+  format: z.string().optional().describe("Post format (standard, aside, gallery, etc.)"),
   menu_order: z.number().optional().describe("Menu order"),
   meta: z.record(z.string(), z.any()).optional().describe("Meta fields"),
   custom_fields: z.record(z.string(), z.any()).optional().describe("Custom fields"),
@@ -226,7 +482,11 @@ const findContentByUrlSchema = z.object({
   site_id: z.string().optional().describe("Site ID (for multi-site setups)"),
   update_fields: z.object({
     title: z.string().optional(),
-    content: z.string().optional(),
+    content: z.string().optional().describe(
+      "Content body. Accepts Gutenberg blocks, HTML, or Markdown. Markdown is auto-converted to HTML when detected."
+    ),
+    content_format: z.enum(['auto', 'markdown', 'html', 'blocks']).optional().default('auto'),
+    convert_to_blocks: z.boolean().optional().default(false),
     status: z.string().optional(),
     meta: z.record(z.string(), z.any()).optional(),
     custom_fields: z.record(z.string(), z.any()).optional()
@@ -469,11 +729,12 @@ export const unifiedContentHandlers = {
 
   create_content: async (params: CreateContentParams) => {
     try {
+      const input = await processWriteContent(params);
       const preparedRequest = await prepareContentWriteRequest({
         operation: 'create',
-        contentType: params.content_type,
-        siteId: params.site_id,
-        input: params
+        contentType: input.content_type,
+        siteId: input.site_id,
+        input
       });
 
       const response = await makeWordPressRequest('POST', preparedRequest.endpoint, preparedRequest.data, {
@@ -483,7 +744,7 @@ export const unifiedContentHandlers = {
       });
 
       const warnings: string[] = [];
-      const focusKeyword = readFocusKeywordForRankMathSync(preparedRequest.data, params);
+      const focusKeyword = readFocusKeywordForRankMathSync(preparedRequest.data, input);
       if (focusKeyword && response && typeof response === 'object' && typeof (response as any).id === 'number') {
         const rankMathActive = await isRankMathActive(false, params.site_id);
         if (rankMathActive) {
@@ -532,11 +793,12 @@ export const unifiedContentHandlers = {
 
   update_content: async (params: UpdateContentParams) => {
     try {
+      const input = await processWriteContent(params);
       const preparedRequest = await prepareContentWriteRequest({
         operation: 'update',
-        contentType: params.content_type,
-        siteId: params.site_id,
-        input: params
+        contentType: input.content_type,
+        siteId: input.site_id,
+        input
       });
 
       const response = await makeWordPressRequest(
@@ -551,7 +813,7 @@ export const unifiedContentHandlers = {
       );
 
       const warnings: string[] = [];
-      const focusKeyword = readFocusKeywordForRankMathSync(preparedRequest.data, params);
+      const focusKeyword = readFocusKeywordForRankMathSync(preparedRequest.data, input);
       if (focusKeyword) {
         const rankMathActive = await isRankMathActive(false, params.site_id);
         if (rankMathActive) {
@@ -824,7 +1086,13 @@ export const unifiedContentHandlers = {
           
           const updateData: any = {};
           if (params.update_fields.title !== undefined) updateData.title = params.update_fields.title;
-          if (params.update_fields.content !== undefined) updateData.content = params.update_fields.content;
+          if (params.update_fields.content !== undefined) {
+            updateData.content = await processContent(
+              params.update_fields.content,
+              params.update_fields.content_format || 'auto',
+              params.update_fields.convert_to_blocks || false
+            );
+          }
           if (params.update_fields.status !== undefined) updateData.status = params.update_fields.status;
           if (params.update_fields.meta !== undefined) updateData.meta = params.update_fields.meta;
           if (params.update_fields.custom_fields !== undefined) {
@@ -902,7 +1170,13 @@ export const unifiedContentHandlers = {
         
         const updateData: any = {};
         if (params.update_fields.title !== undefined) updateData.title = params.update_fields.title;
-        if (params.update_fields.content !== undefined) updateData.content = params.update_fields.content;
+        if (params.update_fields.content !== undefined) {
+          updateData.content = await processContent(
+            params.update_fields.content,
+            params.update_fields.content_format || 'auto',
+            params.update_fields.convert_to_blocks || false
+          );
+        }
         if (params.update_fields.status !== undefined) updateData.status = params.update_fields.status;
         if (params.update_fields.meta !== undefined) updateData.meta = params.update_fields.meta;
         if (params.update_fields.custom_fields !== undefined) {

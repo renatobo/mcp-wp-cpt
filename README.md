@@ -403,6 +403,39 @@ The server supports up to 10 sites. When using multi-site configuration, all too
 
 Contract manifests are cached per site, so multi-site setups can safely expose different plugin contracts. Use `refresh_cache: true` on `discover_content_types` or `describe_content_type` after plugin updates.
 
+## Using with npx and .env file
+
+You can run this MCP server directly using npx without installing it globally:
+
+```bash
+npx -y @instawp/mcp-wp
+```
+
+Make sure you have a `.env` file in your current directory with the following variables:
+
+```env
+WORDPRESS_API_URL=https://your-wordpress-site.com
+WORDPRESS_USERNAME=wp_username
+WORDPRESS_PASSWORD=wp_app_password
+
+# Optional: Custom SQL query endpoint (default: /mcp/v1/query)
+WORDPRESS_SQL_ENDPOINT=/mcp/v1/query
+```
+
+## Enabling SQL Query Tool (Optional)
+
+The `execute_sql_query` tool allows read-only SQL queries against your WordPress database. This optional feature requires adding a custom REST API endpoint to your WordPress site.
+
+**Security Notes:**
+
+- This tool only accepts read-only queries (`SELECT`, `WITH...SELECT`, `EXPLAIN`)
+- Queries containing `INSERT`, `UPDATE`, `DELETE`, `DROP`, or other modifying statements are rejected
+- Multi-statement queries are blocked to reduce SQL injection risk
+- Queries and results may be logged, so avoid sensitive data in queries
+- This tool requires admin-level permissions (`manage_options` capability)
+
+By default, the tool expects the endpoint at `/mcp/v1/query`. You can customize it with `WORDPRESS_SQL_ENDPOINT`.
+
 ## Development
 
 The main local setup instructions are in [Run Locally](#run-locally).
@@ -452,7 +485,7 @@ src/
 └── tools/
     ├── index.ts                # Tool aggregation
     ├── site-management.ts      # Site management (3 tools)
-    ├── unified-content.ts      # Universal content management (8 tools)
+    ├── unified-content.ts      # Universal content management (9 tools)
     ├── unified-taxonomies.ts   # Universal taxonomy management (8 tools)
     ├── media.ts               # Media management (~5 tools)
     ├── users.ts               # User management (~5 tools)
