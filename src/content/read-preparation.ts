@@ -5,6 +5,7 @@ import {
 } from '../adapters/types.js';
 import {
   getContentEndpoint,
+  getPreferredReadEndpoint,
   getDefensiveEndpointFallback,
   removeUndefinedValues,
   splitNamespacedEndpoint
@@ -25,6 +26,11 @@ export interface PreparedListContentRequest {
     namespace?: string;
   };
   queryParams: Record<string, unknown>;
+  responseFilter?: {
+    eventStartAfter?: string;
+    eventStartBefore?: string;
+    eventStartOrder?: 'asc' | 'desc';
+  };
   contractResolution: ContractResolution;
 }
 
@@ -87,6 +93,10 @@ export function buildListContentRequest(
     );
   }
 
+  if (canUseDirectContractReadRequest(contractResolution)) {
+    return buildDirectContractReadRequest(queryParams, contractResolution);
+  }
+
   return {
     endpoint: getContentEndpoint(contractResolution.contentType),
     fallbackOn404: getDefensiveEndpointFallback({
@@ -108,16 +118,17 @@ export function buildGetContentRequest(
       contractResolution.contract?.preferred_endpoint,
       fallbackEndpoint
     );
+    const preferredRead = getPreferredReadEndpoint({
+      contentType: contractResolution.contentType,
+      provider: contractResolution.manifest?.provider,
+      endpoint: split.endpoint,
+      namespace: split.namespace || contractResolution.manifest?.namespace
+    });
 
     return {
-      endpoint: split.endpoint,
-      namespace: split.namespace || contractResolution.manifest?.namespace,
-      fallbackOn404: getDefensiveEndpointFallback({
-        contentType: contractResolution.contentType,
-        provider: contractResolution.manifest?.provider,
-        endpoint: split.endpoint,
-        namespace: split.namespace || contractResolution.manifest?.namespace
-      }),
+      endpoint: preferredRead.endpoint,
+      namespace: preferredRead.namespace,
+      fallbackOn404: preferredRead.fallbackOn404,
       contractResolution
     };
   }
@@ -152,6 +163,10 @@ export function canUseContractGetRequest(contractResolution: ContractResolution)
   );
 }
 
+export function canUseDirectContractReadRequest(contractResolution: ContractResolution): boolean {
+  return canUseContractGetRequest(contractResolution);
+}
+
 export function buildContractListRequest(
   queryParams: Record<string, unknown>,
   contractResolution: ContractResolution
@@ -167,19 +182,98 @@ export function buildContractListRequest(
     queryParams,
     contractResolution
   );
+  const preferredRead = getPreferredReadEndpoint({
+    contentType: contractResolution.contentType,
+    provider: contractResolution.manifest?.provider,
+    endpoint,
+    namespace: split.namespace || contractResolution.manifest?.namespace
+  });
+  const responseFilter = normalizeContractListQueryParamsForRead(
+    queryParams,
+    contractResolution,
+    preferredRead
+  );
 
   return {
-    endpoint,
-    namespace: split.namespace || contractResolution.manifest?.namespace,
-    fallbackOn404: getDefensiveEndpointFallback({
-      contentType: contractResolution.contentType,
-      provider: contractResolution.manifest?.provider,
-      endpoint,
-      namespace: split.namespace || contractResolution.manifest?.namespace
-    }),
+    endpoint: preferredRead.endpoint,
+    namespace: preferredRead.namespace,
+    fallbackOn404: preferredRead.fallbackOn404,
     queryParams,
+    responseFilter,
     contractResolution
   };
+}
+
+function buildDirectContractReadRequest(
+  queryParams: Record<string, unknown>,
+  contractResolution: ContractResolution
+): PreparedListContentRequest {
+  const fallbackEndpoint = getContentEndpoint(contractResolution.contentType);
+  const split = splitNamespacedEndpoint(
+    contractResolution.contract?.preferred_endpoint,
+    fallbackEndpoint
+  );
+  const preferredRead = getPreferredReadEndpoint({
+    contentType: contractResolution.contentType,
+    provider: contractResolution.manifest?.provider,
+    endpoint: split.endpoint,
+    namespace: split.namespace || contractResolution.manifest?.namespace
+  });
+  const responseFilter = normalizeContractListQueryParamsForRead(
+    queryParams,
+    contractResolution,
+    preferredRead
+  );
+
+  return {
+    endpoint: preferredRead.endpoint,
+    namespace: preferredRead.namespace,
+    fallbackOn404: preferredRead.fallbackOn404,
+    queryParams,
+    responseFilter,
+    contractResolution
+  };
+}
+
+function normalizeContractListQueryParamsForRead(
+  queryParams: Record<string, unknown>,
+  contractResolution: ContractResolution,
+  preferredRead: {
+    endpoint: string;
+    namespace?: string;
+  }
+): PreparedListContentRequest['responseFilter'] | undefined {
+  const isEventOnEventList =
+    contractResolution.contentType === 'ajde_events' &&
+    contractResolution.manifest?.provider === 'eventon-apify' &&
+    preferredRead.namespace === 'eventonapify/v1' &&
+    preferredRead.endpoint === 'events';
+
+  if (!isEventOnEventList) {
+    return undefined;
+  }
+
+  const responseFilter: PreparedListContentRequest['responseFilter'] = {};
+  const after = typeof queryParams.after === 'string' ? queryParams.after : undefined;
+  const before = typeof queryParams.before === 'string' ? queryParams.before : undefined;
+  const order = queryParams.order === 'desc' ? 'desc' : 'asc';
+
+  if (after) {
+    queryParams.starts_on_or_after = after;
+    responseFilter.eventStartAfter = after;
+  }
+
+  if (before) {
+    responseFilter.eventStartBefore = before;
+  }
+
+  responseFilter.eventStartOrder = order;
+
+  delete queryParams.after;
+  delete queryParams.before;
+  delete queryParams.orderby;
+
+  return responseFilter;
 }
 
 function resolveEndpointTemplate(

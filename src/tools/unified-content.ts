@@ -665,12 +665,13 @@ export const unifiedContentHandlers = {
         namespace: preparedRequest.namespace,
         retry404With: preparedRequest.fallbackOn404
       });
+      const filteredResponse = applyListContentResponseFilter(response, preparedRequest.responseFilter);
       
       return {
         toolResult: {
           content: [{ 
             type: 'text', 
-            text: JSON.stringify(response, null, 2) 
+            text: JSON.stringify(filteredResponse, null, 2) 
           }],
           isError: false
         }
@@ -1291,3 +1292,75 @@ export const unifiedContentHandlers = {
     }
   }
 };
+
+function applyListContentResponseFilter(
+  response: unknown,
+  responseFilter?: {
+    eventStartAfter?: string;
+    eventStartBefore?: string;
+    eventStartOrder?: 'asc' | 'desc';
+  }
+): unknown {
+  if (
+    !responseFilter ||
+    !response ||
+    typeof response !== 'object' ||
+    Array.isArray(response)
+  ) {
+    return response;
+  }
+
+  const payload = response as Record<string, unknown>;
+  const events = Array.isArray(payload.events) ? payload.events : undefined;
+
+  if (!events) {
+    return response;
+  }
+
+  const filteredEvents = events
+    .filter((event) => {
+      if (!event || typeof event !== 'object' || Array.isArray(event)) {
+        return false;
+      }
+
+      const startDate = readEventStartDate(event as Record<string, unknown>);
+      if (!startDate) {
+        return false;
+      }
+
+      if (responseFilter.eventStartAfter && startDate < responseFilter.eventStartAfter) {
+        return false;
+      }
+
+      if (responseFilter.eventStartBefore && startDate >= responseFilter.eventStartBefore) {
+        return false;
+      }
+
+      return true;
+    })
+    .sort((left, right) => {
+      const leftDate = readEventStartDate(left as Record<string, unknown>) || '';
+      const rightDate = readEventStartDate(right as Record<string, unknown>) || '';
+      const comparison = leftDate.localeCompare(rightDate);
+      return responseFilter.eventStartOrder === 'desc' ? comparison * -1 : comparison;
+    });
+
+  return {
+    ...payload,
+    total: filteredEvents.length,
+    page: 1,
+    pages: 1,
+    per_page: filteredEvents.length,
+    events: filteredEvents
+  };
+}
+
+function readEventStartDate(event: Record<string, unknown>): string | undefined {
+  const startAt = typeof event.start_at === 'string' ? event.start_at : undefined;
+  if (startAt) {
+    return startAt.slice(0, 10);
+  }
+
+  const startDate = typeof event.start_date === 'string' ? event.start_date : undefined;
+  return startDate;
+}

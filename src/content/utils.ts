@@ -81,3 +81,35 @@ export function getDefensiveEndpointFallback(args: {
 
   return undefined;
 }
+
+export function getPreferredReadEndpoint(args: {
+  contentType: string;
+  provider?: string;
+  endpoint: string;
+  namespace?: string;
+}): { endpoint: string; namespace?: string; fallbackOn404?: { endpoint: string; namespace?: string } } {
+  const endpoint = args.endpoint.replace(/^\/+|\/+$/g, '');
+  const namespace = args.namespace || 'wp/v2';
+
+  if (
+    args.provider === 'eventon-apify' &&
+    args.contentType === 'ajde_events' &&
+    namespace === 'wp/v2' &&
+    endpoint === 'ajde_events'
+  ) {
+    return {
+      endpoint: 'events',
+      namespace: 'eventonapify/v1',
+      fallbackOn404: {
+        endpoint: 'ajde_events',
+        namespace: 'wp/v2'
+      }
+    };
+  }
+
+  return {
+    endpoint,
+    namespace,
+    fallbackOn404: getDefensiveEndpointFallback(args)
+  };
+}
