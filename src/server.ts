@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // src/server.ts
 import * as dotenv from 'dotenv';
-dotenv.config(); // Load environment variables from .env first
+dotenv.config({ quiet: true }); // Load environment variables from .env first without writing to MCP stdout
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
