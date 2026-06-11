@@ -80,7 +80,7 @@ const createTermSchema = z.object({
   slug: z.string().optional().describe("Term slug"),
   parent: z.number().optional().describe("Parent term ID"),
   description: z.string().optional().describe("Term description"),
-  meta: z.record(z.any()).optional().describe("Term meta fields")
+  meta: z.record(z.string(), z.any()).optional().describe("Term meta fields")
 });
 
 const updateTermSchema = z.object({
@@ -90,7 +90,7 @@ const updateTermSchema = z.object({
   slug: z.string().optional().describe("Term slug"),
   parent: z.number().optional().describe("Parent term ID"),
   description: z.string().optional().describe("Term description"),
-  meta: z.record(z.any()).optional().describe("Term meta fields")
+  meta: z.record(z.string(), z.any()).optional().describe("Term meta fields")
 });
 
 const deleteTermSchema = z.object({

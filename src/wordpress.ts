@@ -4,7 +4,7 @@ import axios, { AxiosInstance, AxiosRequestConfig } from 'axios';
 import { siteManager } from './config/site-manager.js';
 
 // Legacy global WordPress API client instance for backward compatibility
-let wpClient: AxiosInstance;
+let wpClient: AxiosInstance | undefined;
 
 /**
  * Initialize the WordPress API client with authentication
@@ -32,6 +32,18 @@ export function logToFile(message: string, level: 'debug' | 'info' | 'error' = '
   }
 }
 
+export interface WordPressRequestOptions {
+  headers?: Record<string, string>;
+  isFormData?: boolean;
+  rawResponse?: boolean;
+  siteId?: string;
+  namespace?: string;
+  retry404With?: {
+    endpoint: string;
+    namespace?: string;
+  };
+}
+
 /**
  * Make a request to the WordPress API
  * @param method HTTP method
@@ -44,17 +56,14 @@ export async function makeWordPressRequest(
   method: string, 
   endpoint: string, 
   data?: any, 
-  options?: {
-    headers?: Record<string, string>;
-    isFormData?: boolean;
-    rawResponse?: boolean;
-    siteId?: string;
-  }
+  options?: WordPressRequestOptions
 ) {
+  const namespace = options?.namespace || 'wp/v2';
+
   // Get the appropriate client for the site
   const client = options?.siteId 
-    ? await siteManager.getClient(options.siteId)
-    : (wpClient || await siteManager.getClient());
+    ? await siteManager.getClient(options.siteId, namespace)
+    : (wpClient && namespace === 'wp/v2' ? wpClient : await siteManager.getClient(undefined, namespace));
 
   // Log data (skip for FormData which can't be stringified)
   if (!options?.isFormData) {
@@ -93,6 +102,7 @@ REQUEST:
 URL: ${fullUrl}
 Method: ${method}
 Site: ${options?.siteId || 'default'}
+Namespace: ${namespace}
 Headers: ${JSON.stringify({...client.defaults.headers, ...requestConfig.headers}, null, 2)}
 Data: ${options?.isFormData ? '(FormData not shown)' : JSON.stringify(data, null, 2)}
 `;
@@ -109,6 +119,18 @@ Data: ${JSON.stringify(response.data, null, 2)}
     
     return options?.rawResponse ? response : response.data;
   } catch (error: any) {
+    if (axios.isAxiosError(error) && error.response?.status === 404 && options?.retry404With) {
+      logToFile(
+        `Retrying ${method} ${path} against fallback namespace ${options.retry404With.namespace || 'wp/v2'} endpoint ${options.retry404With.endpoint}`
+      );
+
+      return makeWordPressRequest(method, options.retry404With.endpoint, data, {
+        ...options,
+        namespace: options.retry404With.namespace,
+        retry404With: undefined
+      });
+    }
+
     const errorLog = `
 ERROR:
 Message: ${error.message}

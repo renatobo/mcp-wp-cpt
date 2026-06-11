@@ -125,6 +125,29 @@ export class SiteManager {
   }
 
   /**
+   * Resolve a site identifier to the canonical site ID.
+   */
+  resolveSiteId(siteId?: string): string {
+    return this.getSite(siteId).id;
+  }
+
+  /**
+   * Get the REST API root URL for a site.
+   */
+  getRestApiRoot(siteId?: string): string {
+    const site = this.getSite(siteId);
+    let baseURL = site.url.endsWith('/') ? site.url : `${site.url}/`;
+
+    if (!baseURL.includes('/wp-json/')) {
+      baseURL = `${baseURL}wp-json/`;
+    } else if (!baseURL.endsWith('/')) {
+      baseURL = `${baseURL}/`;
+    }
+
+    return baseURL;
+  }
+
+  /**
    * Detect site from context (domain mentions, aliases, etc.)
    */
   detectSiteFromContext(requestText: string): string | null {
@@ -173,31 +196,26 @@ export class SiteManager {
   /**
    * Get WordPress client for a specific site
    */
-  async getClient(siteId?: string): Promise<AxiosInstance> {
+  async getClient(siteId?: string, namespace: string = 'wp/v2'): Promise<AxiosInstance> {
     this.ensureInitialized();
     
     const site = this.getSite(siteId);
+    const clientKey = `${site.id}:${this.normalizeNamespace(namespace)}`;
     
-    if (!this.clients.has(site.id)) {
-      const client = await this.createClient(site);
-      this.clients.set(site.id, client);
+    if (!this.clients.has(clientKey)) {
+      const client = await this.createClient(site, namespace);
+      this.clients.set(clientKey, client);
     }
 
-    return this.clients.get(site.id)!;
+    return this.clients.get(clientKey)!;
   }
 
   /**
    * Create authenticated WordPress client for a site
    */
-  private async createClient(site: SiteConfig): Promise<AxiosInstance> {
-    // Ensure the API URL has the WordPress REST API path
-    let baseURL = site.url.endsWith('/') ? site.url : `${site.url}/`;
-    
-    if (!baseURL.includes('/wp-json/wp/v2')) {
-      baseURL = baseURL + 'wp-json/wp/v2/';
-    } else if (!baseURL.endsWith('/')) {
-      baseURL = baseURL + '/';
-    }
+  private async createClient(site: SiteConfig, namespace: string = 'wp/v2'): Promise<AxiosInstance> {
+    const normalizedNamespace = this.normalizeNamespace(namespace);
+    const baseURL = `${this.getRestApiRoot(site.id)}${normalizedNamespace}/`;
 
     const auth = Buffer.from(`${site.username}:${site.password}`).toString('base64');
     
@@ -212,10 +230,10 @@ export class SiteManager {
     // Test the connection
     try {
       await client.get('');
-      logToFile(`Successfully connected to site '${site.id}' at ${baseURL}`);
+      logToFile(`Successfully connected to site '${site.id}' namespace '${normalizedNamespace}' at ${baseURL}`);
     } catch (error: any) {
-      logToFile(`Failed to connect to site '${site.id}': ${error.message}`);
-      throw new Error(`Failed to connect to site '${site.id}': ${error.message}`);
+      logToFile(`Failed to connect to site '${site.id}' namespace '${normalizedNamespace}': ${error.message}`);
+      throw new Error(`Failed to connect to site '${site.id}' namespace '${normalizedNamespace}': ${error.message}`);
     }
 
     return client;
@@ -234,6 +252,10 @@ export class SiteManager {
     } catch (error: any) {
       return { success: false, error: error.message };
     }
+  }
+
+  private normalizeNamespace(namespace: string): string {
+    return namespace.replace(/^\/+|\/+$/g, '');
   }
 }
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // src/server.ts
 import * as dotenv from 'dotenv';
-dotenv.config(); // Load environment variables from .env first
+dotenv.config({ quiet: true }); // Load environment variables from .env first without writing to MCP stdout
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
@@ -13,7 +13,7 @@ import { zodToJsonSchema } from 'zod-to-json-schema';
 // Create MCP server instance
 const server = new McpServer({
     name: "wordpress",
-    version: "0.0.1"
+    version: "0.0.4"
 }, {
     capabilities: {
         tools: allTools.reduce((acc, tool) => {
@@ -54,8 +54,8 @@ for (const tool of allTools) {
     // const jsonSchema = zodToJsonSchema(z.object(tool.inputSchema.properties as z.ZodRawShape));
     // const parsedSchema = z.any().optional().parse(jsonSchema);
 
-    const zodSchema = z.object(tool.inputSchema.properties as z.ZodRawShape); 
-    server.tool(tool.name, zodSchema.shape, wrappedHandler)
+    const zodSchema = z.object(tool.inputSchema.properties as z.ZodRawShape);
+    server.tool(tool.name, zodSchema.shape as any, wrappedHandler as any);
 
 }
 

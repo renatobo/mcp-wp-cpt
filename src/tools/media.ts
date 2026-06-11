@@ -186,8 +186,8 @@ function buildUploadFilename(originalFilename: string, explicitTitle?: string) {
   return extension ? `${sanitizedTitle}${extension}` : sanitizedTitle;
 }
 
-function normalizeMimeType(contentTypeHeader?: string) {
-  if (!contentTypeHeader) {
+function normalizeMimeType(contentTypeHeader?: unknown) {
+  if (typeof contentTypeHeader !== 'string' || !contentTypeHeader) {
     return 'application/octet-stream';
   }
 

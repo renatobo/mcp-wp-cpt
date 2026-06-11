@@ -5,86 +5,86 @@ import { z } from 'zod';
 import * as fs from 'fs-extra';
 import * as path from 'path';
 import * as os from 'os';
-import { fileURLToPath } from 'url';
 import { marked } from 'marked';
+import { siteManager } from '../config/site-manager.js';
+import { listResolvedContentTypeContracts, resolveContentTypeContract } from '../adapters/registry.js';
+import { loadSiteManifests } from '../adapters/manifest-loader.js';
+import { describeContractExecution } from '../adapters/interpreter.js';
+import { formatContractError, prepareContentWriteRequest } from '../content/write-preparation.js';
+import { getContentEndpoint } from '../content/utils.js';
+import { prepareGetContentRequest, prepareListContentRequest } from '../content/read-preparation.js';
+import { ContractCompatibilityError, ContractValidationError } from '../adapters/types.js';
 
-// Resolve cache directory: prefer env override, fall back to OS temp dir
 const CACHE_DIR = process.env.UNIFIED_CONTENT_CACHE_DIR
   ? path.resolve(process.env.UNIFIED_CONTENT_CACHE_DIR)
   : path.join(os.tmpdir(), 'mcp-wp', '.cache');
 
-// Ensure the cache directory exists at module load time (best-effort)
 fs.ensureDir(CACHE_DIR).catch(() => {});
 
 // Cache for post types to reduce API calls
-let postTypesCache: any = null;
-let cacheTimestamp: number = 0;
-const CACHE_DURATION = parseInt(process.env.WORDPRESS_CACHE_DURATION || '3600000'); // Default 1 hour, configurable
+const postTypesCache = new Map<string, { value: any; timestamp: number }>();
+const CACHE_DURATION = parseInt(process.env.WORDPRESS_CACHE_DURATION || `${5 * 60 * 1000}`, 10);
+const rankMathActiveCache = new Map<string, { value: boolean; timestamp: number }>();
 
-// Helper function to load cache from disk
-async function loadCacheFromDisk(siteId?: string): Promise<{ data: any; timestamp: number } | null> {
+async function loadCacheFromDisk(siteId: string): Promise<{ data: any; timestamp: number } | null> {
   try {
     await fs.ensureDir(CACHE_DIR);
-    const cacheKey = siteId || 'default';
-    const cacheFilePath = path.join(CACHE_DIR, `content-types-${cacheKey}.json`);
+    const cacheFilePath = path.join(CACHE_DIR, `content-types-${siteId}.json`);
 
     if (await fs.pathExists(cacheFilePath)) {
-      const cache = await fs.readJson(cacheFilePath);
-      return cache;
+      return await fs.readJson(cacheFilePath);
     }
   } catch (error) {
-    logToFile(`Failed to load cache from disk: ${error}`, 'debug');
+    logToFile(`Failed to load content type cache from disk: ${error}`, 'debug');
   }
+
   return null;
 }
 
-// Helper function to save cache to disk
-async function saveCacheToDisk(data: any, siteId?: string): Promise<void> {
+async function saveCacheToDisk(siteId: string, data: any): Promise<void> {
   try {
     await fs.ensureDir(CACHE_DIR);
-    const cacheKey = siteId || 'default';
-    const cacheFilePath = path.join(CACHE_DIR, `content-types-${cacheKey}.json`);
-
+    const cacheFilePath = path.join(CACHE_DIR, `content-types-${siteId}.json`);
     await fs.writeJson(cacheFilePath, {
       data,
       timestamp: Date.now()
     });
   } catch (error) {
-    logToFile(`Failed to save cache to disk: ${error}`, 'debug');
+    logToFile(`Failed to save content type cache to disk: ${error}`, 'debug');
   }
 }
 
 // Helper function to get all post types with caching
 async function getPostTypes(forceRefresh = false, siteId?: string) {
   const now = Date.now();
+  const resolvedSiteId = siteManager.resolveSiteId(siteId);
+  const cacheEntry = postTypesCache.get(resolvedSiteId);
 
-  // Try memory cache first
-  if (!forceRefresh && postTypesCache && (now - cacheTimestamp) < CACHE_DURATION) {
+  if (!forceRefresh && cacheEntry && (now - cacheEntry.timestamp) < CACHE_DURATION) {
     logToFile('Using memory-cached post types', 'debug');
-    return postTypesCache;
+    return cacheEntry.value;
   }
 
-  // Try disk cache if memory cache is stale
   if (!forceRefresh) {
-    const diskCache = await loadCacheFromDisk(siteId);
+    const diskCache = await loadCacheFromDisk(resolvedSiteId);
     if (diskCache && (now - diskCache.timestamp) < CACHE_DURATION) {
       logToFile('Using disk-cached post types', 'debug');
-      postTypesCache = diskCache.data;
-      cacheTimestamp = diskCache.timestamp;
+      postTypesCache.set(resolvedSiteId, {
+        value: diskCache.data,
+        timestamp: diskCache.timestamp
+      });
       return diskCache.data;
     }
   }
 
-  // Fetch from API if cache is stale or refresh forced
   try {
     logToFile('Fetching post types from API', 'info');
-    const response = await makeWordPressRequest('GET', 'types', undefined, { siteId });
-    postTypesCache = response;
-    cacheTimestamp = now;
-
-    // Save to disk for persistence
-    await saveCacheToDisk(response, siteId);
-
+    const response = await makeWordPressRequest('GET', 'types', undefined, { siteId: resolvedSiteId });
+    postTypesCache.set(resolvedSiteId, {
+      value: response,
+      timestamp: now
+    });
+    await saveCacheToDisk(resolvedSiteId, response);
     return response;
   } catch (error: any) {
     logToFile(`Error fetching post types: ${error.message}`, 'error');
@@ -92,31 +92,40 @@ async function getPostTypes(forceRefresh = false, siteId?: string) {
   }
 }
 
-// Helper function to get the correct endpoint for a content type
-async function getContentEndpoint(contentType: string, siteId?: string): Promise<string> {
-  // Quick return for standard types
-  const standardMap: Record<string, string> = {
-    'post': 'posts',
-    'page': 'pages'
-  };
+async function isRankMathActive(forceRefresh = false, siteId?: string): Promise<boolean> {
+  const now = Date.now();
+  const resolvedSiteId = siteManager.resolveSiteId(siteId);
+  const cacheEntry = rankMathActiveCache.get(resolvedSiteId);
 
-  if (standardMap[contentType]) {
-    return standardMap[contentType];
+  if (!forceRefresh && cacheEntry && (now - cacheEntry.timestamp) < CACHE_DURATION) {
+    return cacheEntry.value;
   }
 
-  // For custom post types, we need to get the rest_base from discovered types
   try {
-    const postTypes = await getPostTypes(false, siteId);
-    if (postTypes[contentType] && postTypes[contentType].rest_base) {
-      return postTypes[contentType].rest_base;
-    }
-  } catch (error) {
-    logToFile(`Failed to get rest_base for content type ${contentType}: ${error}`);
-  }
+    const response = await makeWordPressRequest('GET', 'plugins', { status: 'active' }, { siteId: resolvedSiteId });
+    const plugins = Array.isArray(response) ? response : [];
 
-  // Fallback: try the content type as-is
-  logToFile(`Warning: No rest_base found for content type '${contentType}', using as-is`);
-  return contentType;
+    const active = plugins.some((plugin: any) => {
+      const pluginFile = typeof plugin?.plugin === 'string' ? plugin.plugin.toLowerCase() : '';
+      const pluginName = typeof plugin?.name === 'string' ? plugin.name.toLowerCase() : '';
+      const pluginTextDomain = typeof plugin?.textdomain === 'string' ? plugin.textdomain.toLowerCase() : '';
+
+      return (
+        pluginFile.includes('seo-by-rank-math') ||
+        pluginFile.includes('rank-math') ||
+        pluginName.includes('rank math') ||
+        pluginTextDomain === 'rank-math'
+      );
+    });
+
+    rankMathActiveCache.set(resolvedSiteId, { value: active, timestamp: now });
+    return active;
+  } catch (error: any) {
+    // If plugin visibility is unavailable (permissions/endpoints), fail closed and skip Rank Math sync.
+    logToFile(`Rank Math plugin status check failed; skipping sync: ${error.message}`);
+    rankMathActiveCache.set(resolvedSiteId, { value: false, timestamp: now });
+    return false;
+  }
 }
 
 // Helper function to parse URL and extract slug and potential post type hints
@@ -144,147 +153,106 @@ function parseUrl(url: string): { slug: string; pathHints: string[] } {
 // Helper function to find content across multiple post types
 async function findContentAcrossTypes(slug: string, contentTypes?: string[], siteId?: string) {
   const typesToSearch = contentTypes || [];
-
+  
   // If no specific content types provided, get all available types
   if (typesToSearch.length === 0) {
     const allTypes = await getPostTypes(false, siteId);
-    typesToSearch.push(...Object.keys(allTypes).filter(type =>
+    typesToSearch.push(...Object.keys(allTypes).filter(type => 
       type !== 'attachment' && type !== 'wp_block'
     ));
   }
-
+  
   logToFile(`Searching for slug "${slug}" across content types: ${typesToSearch.join(', ')}`, 'debug');
 
-  // Check if parallel search is enabled (default: true)
-  const enableParallel = process.env.WORDPRESS_PARALLEL_SEARCH !== 'false';
+  const searchOne = async (contentType: string) => {
+    try {
+      const endpoint = getContentEndpoint(contentType);
 
-  if (enableParallel && typesToSearch.length > 1) {
-    // Parallel search for better performance
-    const searchPromises = typesToSearch.map(async (contentType) => {
-      try {
-        const endpoint = await getContentEndpoint(contentType, siteId);
-        const response = await makeWordPressRequest('GET', endpoint, {
-          slug: slug,
-          per_page: 1
-        }, { siteId });
+      const response = await makeWordPressRequest('GET', endpoint, {
+        slug,
+        per_page: 1
+      }, { siteId });
 
-        if (Array.isArray(response) && response.length > 0) {
-          logToFile(`Found content with slug "${slug}" in content type "${contentType}"`, 'info');
-          return { content: response[0], contentType };
-        }
-      } catch (error) {
-        logToFile(`Error searching ${contentType}: ${error}`, 'debug');
+      if (Array.isArray(response) && response.length > 0) {
+        logToFile(`Found content with slug "${slug}" in content type "${contentType}"`, 'info');
+        return { content: response[0], contentType };
       }
-      return null;
-    });
-
-    // Execute all searches in parallel
-    const results = await Promise.all(searchPromises);
-
-    // Return first non-null result
-    const found = results.find(result => result !== null);
-    if (found) return found;
-  } else {
-    // Sequential search (fallback or when only 1 type)
-    for (const contentType of typesToSearch) {
-      try {
-        const endpoint = await getContentEndpoint(contentType, siteId);
-
-        const response = await makeWordPressRequest('GET', endpoint, {
-          slug: slug,
-          per_page: 1
-        }, { siteId });
-
-        if (Array.isArray(response) && response.length > 0) {
-          logToFile(`Found content with slug "${slug}" in content type "${contentType}"`, 'info');
-          return { content: response[0], contentType };
-        }
-      } catch (error) {
-        logToFile(`Error searching ${contentType}: ${error}`, 'debug');
-      }
+    } catch (error) {
+      logToFile(`Error searching ${contentType}: ${error}`, 'debug');
     }
+
+    return null;
+  };
+
+  if (process.env.WORDPRESS_PARALLEL_SEARCH !== 'false' && typesToSearch.length > 1) {
+    const results = await Promise.all(typesToSearch.map(searchOne));
+    const found = results.find((result) => result !== null);
+    if (found) {
+      return found;
+    }
+
+    return null;
   }
 
+  for (const contentType of typesToSearch) {
+    const result = await searchOne(contentType);
+    if (result) {
+      return result;
+    }
+  }
+  
   return null;
 }
 
-// Content format types
 type ContentFormat = 'auto' | 'markdown' | 'html' | 'blocks';
 type DetectedFormat = 'blocks' | 'html' | 'markdown' | 'text';
 
-/**
- * Detects the format of content based on its structure
- */
 function detectContentFormat(content: string): DetectedFormat {
-  // Check for Gutenberg blocks first (most specific)
   if (/<!--\s*wp:/.test(content)) {
     return 'blocks';
   }
 
-  // Check for HTML tags
   if (/<[a-z][\s\S]*>/i.test(content)) {
     return 'html';
   }
 
-  // Check for common Markdown patterns
   const markdownPatterns = [
-    /^#{1,6}\s+/m,           // Headers: # Header
-    /\*\*[^*]+\*\*/,         // Bold: **text**
-    /\*[^*]+\*/,             // Italic: *text*
-    /\[[^\]]+\]\([^)]+\)/,   // Links: [text](url)
-    /^[-*+]\s+/m,            // Unordered lists: - item
-    /^\d+\.\s+/m,            // Ordered lists: 1. item
-    /^>\s+/m,                // Blockquotes: > quote
-    /`[^`]+`/,               // Inline code: `code`
-    /^```/m,                 // Code blocks: ```
-    /!\[[^\]]*\]\([^)]+\)/,  // Images: ![alt](url)
-    /^---$/m,                // Horizontal rule
-    /^\|.*\|$/m,             // Tables: | col1 | col2 |
+    /^#{1,6}\s+/m,
+    /\*\*[^*]+\*\*/,
+    /\*[^*]+\*/,
+    /\[[^\]]+\]\([^)]+\)/,
+    /^[-*+]\s+/m,
+    /^\d+\.\s+/m,
+    /^>\s+/m,
+    /`[^`]+`/,
+    /^```/m,
+    /!\[[^\]]*\]\([^)]+\)/,
+    /^---$/m,
+    /^\|.*\|$/m
   ];
 
-  for (const pattern of markdownPatterns) {
-    if (pattern.test(content)) {
-      return 'markdown';
-    }
-  }
-
-  return 'text';
+  return markdownPatterns.some((pattern) => pattern.test(content)) ? 'markdown' : 'text';
 }
 
-/**
- * Converts Markdown to HTML using the marked library
- */
 async function convertMarkdownToHtml(markdown: string): Promise<string> {
   try {
-    // Configure marked for WordPress-friendly output
-    const html = await marked(markdown, {
-      gfm: true,       // GitHub Flavored Markdown
-      breaks: false,   // Don't convert \n to <br>
+    return await marked(markdown, {
+      gfm: true,
+      breaks: false
     });
-
-    return html;
   } catch (error) {
     logToFile(`Error converting markdown to HTML: ${error}`, 'error');
     throw error;
   }
 }
 
-/**
- * Converts HTML to Gutenberg block format
- * Wraps HTML elements in appropriate WordPress block comments
- */
 function convertHtmlToBlocks(html: string): string {
   const blocks: string[] = [];
-
-  // Split HTML into manageable chunks for block conversion
-  // This regex matches common block-level elements
   const blockRegex = /<(p|h[1-6]|ul|ol|blockquote|pre|table|hr|div)[^>]*>[\s\S]*?<\/\1>|<(hr|br)\s*\/?>/gi;
-
   let match;
   let lastIndex = 0;
 
   while ((match = blockRegex.exec(html)) !== null) {
-    // Handle any text before this match
     const textBefore = html.slice(lastIndex, match.index).trim();
     if (textBefore) {
       blocks.push(`<!-- wp:paragraph -->\n<p>${textBefore}</p>\n<!-- /wp:paragraph -->`);
@@ -334,20 +302,17 @@ function convertHtmlToBlocks(html: string): string {
         blocks.push(`<!-- wp:separator -->\n<hr class="wp-block-separator has-alpha-channel-opacity"/>\n<!-- /wp:separator -->`);
         break;
       default:
-        // Wrap unknown elements in a paragraph block
         blocks.push(`<!-- wp:paragraph -->\n${element}\n<!-- /wp:paragraph -->`);
     }
 
     lastIndex = match.index + match[0].length;
   }
 
-  // Handle any remaining content after the last match
   const remaining = html.slice(lastIndex).trim();
   if (remaining) {
     blocks.push(`<!-- wp:paragraph -->\n<p>${remaining}</p>\n<!-- /wp:paragraph -->`);
   }
 
-  // If no blocks were created, wrap the entire content
   if (blocks.length === 0 && html.trim()) {
     return `<!-- wp:paragraph -->\n<p>${html}</p>\n<!-- /wp:paragraph -->`;
   }
@@ -355,63 +320,70 @@ function convertHtmlToBlocks(html: string): string {
   return blocks.join('\n\n');
 }
 
-/**
- * Main content processing function
- * Handles format detection, conversion, and optional block wrapping
- */
 async function processContent(
   content: string,
   format: ContentFormat = 'auto',
-  convertToBlocks: boolean = false
+  convertToBlocks = false
 ): Promise<string> {
-  // Early return for empty content
   if (!content || !content.trim()) {
     return content;
   }
 
-  // Detect format if auto
-  let detectedFormat: DetectedFormat;
-  if (format === 'auto') {
-    detectedFormat = detectContentFormat(content);
-    logToFile(`Auto-detected content format: ${detectedFormat}`, 'debug');
-  } else {
-    detectedFormat = format === 'blocks' ? 'blocks' : format === 'html' ? 'html' : format === 'markdown' ? 'markdown' : 'text';
-  }
+  const detectedFormat =
+    format === 'auto'
+      ? detectContentFormat(content)
+      : format === 'blocks'
+        ? 'blocks'
+        : format === 'html'
+          ? 'html'
+          : format === 'markdown'
+            ? 'markdown'
+            : 'text';
 
-  // If content is already blocks, pass through as-is
+  logToFile(`Content format: ${detectedFormat}`, 'debug');
+
   if (detectedFormat === 'blocks') {
-    logToFile('Content is already in Gutenberg block format, passing through', 'debug');
     return content;
   }
 
-  // Convert markdown to HTML if needed
   let htmlContent: string;
   if (detectedFormat === 'markdown') {
-    logToFile('Converting markdown to HTML', 'debug');
     htmlContent = await convertMarkdownToHtml(content);
   } else if (detectedFormat === 'html') {
     htmlContent = content;
   } else {
-    // Plain text - wrap in paragraph tags
     htmlContent = `<p>${content.replace(/\n\n/g, '</p>\n<p>').replace(/\n/g, '<br>')}</p>`;
   }
 
-  // Convert to blocks if requested
-  if (convertToBlocks) {
-    logToFile('Converting HTML to Gutenberg blocks', 'debug');
-    return convertHtmlToBlocks(htmlContent);
+  return convertToBlocks ? convertHtmlToBlocks(htmlContent) : htmlContent;
+}
+
+async function processWriteContent<T extends { content?: string; content_format?: ContentFormat; convert_to_blocks?: boolean }>(
+  input: T
+): Promise<T> {
+  if (input.content === undefined) {
+    return input;
   }
 
-  return htmlContent;
+  return {
+    ...input,
+    content: await processContent(
+      input.content,
+      input.content_format || 'auto',
+      input.convert_to_blocks || false
+    )
+  };
 }
 
 // Schema definitions
 const listContentSchema = z.object({
   content_type: z.string().describe("The content type slug (e.g., 'post', 'page', 'product', 'documentation')"),
   site_id: z.string().optional().describe("Site ID (for multi-site setups)"),
+  event_id: z.number().optional().describe("Parent event ID for contract-backed nested content types such as 'event_rsvps'"),
   page: z.number().optional().describe("Page number (default 1)"),
   per_page: z.number().min(1).max(100).optional().describe("Items per page (default 10, max 100)"),
   search: z.string().optional().describe("Search term for content title or body"),
+  rsvp: z.enum(['all', 'yes', 'no', 'maybe']).optional().describe("RSVP filter for contract-backed attendee content types such as 'event_rsvps'"),
   slug: z.string().optional().describe("Limit result to content with a specific slug"),
   status: z.string().optional().describe("Content status (publish, draft, etc.)"),
   author: z.union([z.number(), z.array(z.number())]).optional().describe("Author ID or array of IDs"),
@@ -422,11 +394,11 @@ const listContentSchema = z.object({
   order: z.enum(['asc', 'desc']).optional().describe("Order sort attribute"),
   after: z.string().optional().describe("ISO8601 date string to get content published after this date"),
   before: z.string().optional().describe("ISO8601 date string to get content published before this date")
-});
+}).passthrough();
 
 const getContentSchema = z.object({
   content_type: z.string().describe("The content type slug"),
-  id: z.coerce.number().describe("Content ID"),
+  id: z.number().describe("Content ID"),
   site_id: z.string().optional().describe("Site ID (for multi-site setups)")
 });
 
@@ -434,9 +406,8 @@ const createContentSchema = z.object({
   content_type: z.string().describe("The content type slug"),
   site_id: z.string().optional().describe("Site ID (for multi-site setups)"),
   title: z.string().describe("Content title"),
-  content: z.string().describe(
-    "Content body. Accepts: Gutenberg blocks (<!-- wp:paragraph --><p>text</p><!-- /wp:paragraph -->), " +
-    "HTML, or Markdown. Markdown is auto-converted to HTML when detected."
+  content: z.string().optional().describe(
+    "Content body. Accepts Gutenberg blocks, HTML, or Markdown. Markdown is auto-converted to HTML when detected."
   ),
   content_format: z.enum(['auto', 'markdown', 'html', 'blocks']).optional().default('auto').describe(
     "Content format hint: 'auto' (detect and convert), 'markdown', 'html', or 'blocks' (Gutenberg)"
@@ -454,18 +425,18 @@ const createContentSchema = z.object({
   featured_media: z.number().optional().describe("Featured image ID"),
   format: z.string().optional().describe("Post format (standard, aside, gallery, etc.)"),
   menu_order: z.number().optional().describe("Menu order (for pages)"),
-  meta: z.record(z.any()).optional().describe("Meta fields"),
-  custom_fields: z.record(z.any()).optional().describe("Custom fields specific to this content type")
+  meta: z.record(z.string(), z.any()).optional().describe("Meta fields"),
+  custom_fields: z.record(z.string(), z.any()).optional().describe("Custom fields specific to this content type"),
+  fields: z.record(z.string(), z.any()).optional().describe("Structured contract-backed fields. Prefer this over custom_fields when describe_content_type reports preferred_write_mode=fields.")
 });
 
 const updateContentSchema = z.object({
   content_type: z.string().describe("The content type slug"),
-  id: z.coerce.number().describe("Content ID"),
+  id: z.number().describe("Content ID"),
   site_id: z.string().optional().describe("Site ID (for multi-site setups)"),
   title: z.string().optional().describe("Content title"),
   content: z.string().optional().describe(
-    "Content body. Accepts: Gutenberg blocks (<!-- wp:paragraph --><p>text</p><!-- /wp:paragraph -->), " +
-    "HTML, or Markdown. Markdown is auto-converted to HTML when detected."
+    "Content body. Accepts Gutenberg blocks, HTML, or Markdown. Markdown is auto-converted to HTML when detected."
   ),
   content_format: z.enum(['auto', 'markdown', 'html', 'blocks']).optional().default('auto').describe(
     "Content format hint: 'auto' (detect and convert), 'markdown', 'html', or 'blocks' (Gutenberg)"
@@ -483,13 +454,14 @@ const updateContentSchema = z.object({
   featured_media: z.number().optional().describe("Featured image ID"),
   format: z.string().optional().describe("Post format (standard, aside, gallery, etc.)"),
   menu_order: z.number().optional().describe("Menu order"),
-  meta: z.record(z.any()).optional().describe("Meta fields"),
-  custom_fields: z.record(z.any()).optional().describe("Custom fields")
+  meta: z.record(z.string(), z.any()).optional().describe("Meta fields"),
+  custom_fields: z.record(z.string(), z.any()).optional().describe("Custom fields"),
+  fields: z.record(z.string(), z.any()).optional().describe("Structured contract-backed fields. Prefer this over custom_fields when describe_content_type reports preferred_write_mode=fields.")
 });
 
 const deleteContentSchema = z.object({
   content_type: z.string().describe("The content type slug"),
-  id: z.coerce.number().describe("Content ID"),
+  id: z.number().describe("Content ID"),
   site_id: z.string().optional().describe("Site ID (for multi-site setups)"),
   force: z.boolean().optional().describe("Whether to bypass trash and force deletion")
 });
@@ -499,19 +471,25 @@ const discoverContentTypesSchema = z.object({
   site_id: z.string().optional().describe("Site ID (for multi-site setups)")
 });
 
+const describeContentTypeSchema = z.object({
+  content_type: z.string().describe("The content type slug"),
+  refresh_cache: z.boolean().optional().describe("Force refresh the content type and manifest caches"),
+  site_id: z.string().optional().describe("Site ID (for multi-site setups)")
+});
+
 const findContentByUrlSchema = z.object({
   url: z.string().describe("The full URL of the content to find"),
   site_id: z.string().optional().describe("Site ID (for multi-site setups)"),
   update_fields: z.object({
     title: z.string().optional(),
     content: z.string().optional().describe(
-      "Content body. Accepts Gutenberg blocks, HTML, or Markdown (auto-converted to HTML)."
+      "Content body. Accepts Gutenberg blocks, HTML, or Markdown. Markdown is auto-converted to HTML when detected."
     ),
     content_format: z.enum(['auto', 'markdown', 'html', 'blocks']).optional().default('auto'),
     convert_to_blocks: z.boolean().optional().default(false),
     status: z.string().optional(),
-    meta: z.record(z.any()).optional(),
-    custom_fields: z.record(z.any()).optional()
+    meta: z.record(z.string(), z.any()).optional(),
+    custom_fields: z.record(z.string(), z.any()).optional()
   }).optional().describe("Optional fields to update after finding the content")
 });
 
@@ -528,8 +506,102 @@ type CreateContentParams = z.infer<typeof createContentSchema>;
 type UpdateContentParams = z.infer<typeof updateContentSchema>;
 type DeleteContentParams = z.infer<typeof deleteContentSchema>;
 type DiscoverContentTypesParams = z.infer<typeof discoverContentTypesSchema>;
+type DescribeContentTypeParams = z.infer<typeof describeContentTypeSchema>;
 type FindContentByUrlParams = z.infer<typeof findContentByUrlSchema>;
 type GetContentBySlugParams = z.infer<typeof getContentBySlugSchema>;
+
+function normalizeFocusKeywordValue(value: unknown): string | undefined {
+  if (typeof value === 'string') {
+    const normalized = value.trim();
+    return normalized.length > 0 ? normalized : undefined;
+  }
+
+  if (Array.isArray(value)) {
+    const normalized = value
+      .map((entry) => (typeof entry === 'string' ? entry.trim() : String(entry).trim()))
+      .filter((entry) => entry.length > 0)
+      .join(',');
+
+    return normalized.length > 0 ? normalized : undefined;
+  }
+
+  return undefined;
+}
+
+function readFocusKeywordFromMeta(metaValue: unknown): string | undefined {
+  if (!metaValue || typeof metaValue !== 'object' || Array.isArray(metaValue)) {
+    return undefined;
+  }
+
+  const meta = metaValue as Record<string, unknown>;
+  return normalizeFocusKeywordValue(meta.rank_math_focus_keyword);
+}
+
+function readFocusKeywordForRankMathSync(
+  payload: Record<string, unknown>,
+  input: { meta?: Record<string, unknown>; custom_fields?: Record<string, unknown>; fields?: Record<string, unknown> }
+): string | undefined {
+  // Preferred source: explicit Rank Math meta in the outgoing payload.
+  const fromPayloadMeta = readFocusKeywordFromMeta(payload.meta);
+  if (fromPayloadMeta) {
+    return fromPayloadMeta;
+  }
+
+  // Structured contracts may map into top-level keys.
+  const fromPayloadRankMath = normalizeFocusKeywordValue(payload.rank_math_focus_keyword);
+  if (fromPayloadRankMath) {
+    return fromPayloadRankMath;
+  }
+
+  const fromPayloadFocusKeyword = normalizeFocusKeywordValue(payload.focus_keyword);
+  if (fromPayloadFocusKeyword) {
+    return fromPayloadFocusKeyword;
+  }
+
+  const fromInputMeta = readFocusKeywordFromMeta(input.meta);
+  if (fromInputMeta) {
+    return fromInputMeta;
+  }
+
+  const fromCustomFieldRankMath = normalizeFocusKeywordValue(input.custom_fields?.rank_math_focus_keyword);
+  if (fromCustomFieldRankMath) {
+    return fromCustomFieldRankMath;
+  }
+
+  const fromCustomFieldFocusKeyword = normalizeFocusKeywordValue(input.custom_fields?.focus_keyword);
+  if (fromCustomFieldFocusKeyword) {
+    return fromCustomFieldFocusKeyword;
+  }
+
+  const fromStructuredRankMath = normalizeFocusKeywordValue(input.fields?.rank_math_focus_keyword);
+  if (fromStructuredRankMath) {
+    return fromStructuredRankMath;
+  }
+
+  return normalizeFocusKeywordValue(input.fields?.focus_keyword);
+}
+
+async function syncRankMathFocusKeyword(
+  contentId: number,
+  focusKeyword: string,
+  siteId?: string
+): Promise<void> {
+  await makeWordPressRequest(
+    'POST',
+    'updateMeta',
+    {
+      objectType: 'post',
+      objectID: contentId,
+      meta: {
+        rank_math_focus_keyword: focusKeyword
+      }
+    },
+    {
+      siteId,
+      namespace: 'rankmath/v1'
+    }
+  );
+}
 
 export const unifiedContentTools: Tool[] = [
   {
@@ -563,6 +635,11 @@ export const unifiedContentTools: Tool[] = [
     inputSchema: { type: "object", properties: discoverContentTypesSchema.shape }
   },
   {
+    name: "describe_content_type",
+    description: "Returns site-specific guidance, contract metadata, and any plugin-published contract for a content type",
+    inputSchema: { type: "object", properties: describeContentTypeSchema.shape }
+  },
+  {
     name: "find_content_by_url", 
     description: "Finds content by its URL, automatically detecting the content type, and optionally updates it",
     inputSchema: { type: "object", properties: findContentByUrlSchema.shape }
@@ -577,30 +654,39 @@ export const unifiedContentTools: Tool[] = [
 export const unifiedContentHandlers = {
   list_content: async (params: ListContentParams) => {
     try {
-      const endpoint = await getContentEndpoint(params.content_type, params.site_id);
-      const { content_type, site_id, ...queryParams } = params;
+      const preparedRequest = await prepareListContentRequest({
+        contentType: params.content_type,
+        siteId: params.site_id,
+        input: params
+      });
 
-      const response = await makeWordPressRequest('GET', endpoint, queryParams, { siteId: site_id });
-
+      const response = await makeWordPressRequest('GET', preparedRequest.endpoint, preparedRequest.queryParams, {
+        siteId: params.site_id,
+        namespace: preparedRequest.namespace,
+        retry404With: preparedRequest.fallbackOn404
+      });
+      const filteredResponse = applyListContentResponseFilter(response, preparedRequest.responseFilter);
+      
       return {
         toolResult: {
-          content: [{
-            type: 'text',
-            text: JSON.stringify(response, null, 2)
+          content: [{ 
+            type: 'text', 
+            text: JSON.stringify(filteredResponse, null, 2) 
           }],
           isError: false
         }
       };
     } catch (error: any) {
-      // Add helpful guidance for agents
-      const guidance = error.message.includes('404') || error.message.includes('Not Found')
-        ? '\nHint: Try running discover_content_types first to see available content types.'
-        : '';
+      const message =
+        error instanceof ContractCompatibilityError
+          ? formatContractError(error)
+          : `Error listing content: ${error.message}`;
+
       return {
         toolResult: {
-          content: [{
-            type: 'text',
-            text: `Error listing content: ${error.message}${guidance}`
+          content: [{ 
+            type: 'text', 
+            text: message
           }],
           isError: true
         }
@@ -610,27 +696,31 @@ export const unifiedContentHandlers = {
 
   get_content: async (params: GetContentParams) => {
     try {
-      const endpoint = await getContentEndpoint(params.content_type, params.site_id);
-      const response = await makeWordPressRequest('GET', `${endpoint}/${params.id}`, undefined, { siteId: params.site_id });
-
+      const preparedRequest = await prepareGetContentRequest({
+        contentType: params.content_type,
+        siteId: params.site_id
+      });
+      const response = await makeWordPressRequest('GET', `${preparedRequest.endpoint}/${params.id}`, undefined, {
+        siteId: params.site_id,
+        namespace: preparedRequest.namespace,
+        retry404With: preparedRequest.fallbackOn404
+      });
+      
       return {
         toolResult: {
-          content: [{
-            type: 'text',
-            text: JSON.stringify(response, null, 2)
+          content: [{ 
+            type: 'text', 
+            text: JSON.stringify(response, null, 2) 
           }],
           isError: false
         }
       };
     } catch (error: any) {
-      const guidance = error.message.includes('404') || error.message.includes('Not Found')
-        ? '\nHint: Check if the content type exists with discover_content_types.'
-        : '';
       return {
         toolResult: {
-          content: [{
-            type: 'text',
-            text: `Error getting content: ${error.message}${guidance}`
+          content: [{ 
+            type: 'text', 
+            text: `Error getting content: ${error.message}` 
           }],
           isError: true
         }
@@ -640,67 +730,61 @@ export const unifiedContentHandlers = {
 
   create_content: async (params: CreateContentParams) => {
     try {
-      const endpoint = await getContentEndpoint(params.content_type, params.site_id);
-
-      // Process content format (markdown -> HTML, optional block conversion)
-      const processedContent = await processContent(
-        params.content,
-        params.content_format || 'auto',
-        params.convert_to_blocks || false
-      );
-
-      const contentData: any = {
-        title: params.title,
-        content: processedContent,
-        status: params.status,
-        excerpt: params.excerpt,
-        slug: params.slug,
-        author: params.author,
-        parent: params.parent,
-        featured_media: params.featured_media,
-        format: params.format,
-        menu_order: params.menu_order
-      };
-      
-      // Add post-specific fields
-      if (params.categories) contentData.categories = params.categories;
-      if (params.tags) contentData.tags = params.tags;
-      
-      // Add meta fields
-      if (params.meta) contentData.meta = params.meta;
-      
-      // Add custom fields
-      if (params.custom_fields) {
-        Object.assign(contentData, params.custom_fields);
-      }
-      
-      // Remove undefined values
-      Object.keys(contentData).forEach(key => {
-        if (contentData[key] === undefined) {
-          delete contentData[key];
-        }
+      const input = await processWriteContent(params);
+      const preparedRequest = await prepareContentWriteRequest({
+        operation: 'create',
+        contentType: input.content_type,
+        siteId: input.site_id,
+        input
       });
-      
-      const response = await makeWordPressRequest('POST', endpoint, contentData, { siteId: params.site_id });
+
+      const response = await makeWordPressRequest('POST', preparedRequest.endpoint, preparedRequest.data, {
+        siteId: params.site_id,
+        namespace: preparedRequest.namespace,
+        retry404With: preparedRequest.fallbackOn404
+      });
+
+      const warnings: string[] = [];
+      const focusKeyword = readFocusKeywordForRankMathSync(preparedRequest.data, input);
+      if (focusKeyword && response && typeof response === 'object' && typeof (response as any).id === 'number') {
+        const rankMathActive = await isRankMathActive(false, params.site_id);
+        if (rankMathActive) {
+          try {
+            await syncRankMathFocusKeyword((response as any).id, focusKeyword, params.site_id);
+          } catch (error: any) {
+            const message = `Rank Math focus keyword sync failed: ${error.message}`;
+            warnings.push(message);
+            logToFile(message);
+          }
+        } else {
+          logToFile('Rank Math plugin is not active; skipping focus keyword sync.');
+        }
+      }
+
+      const responseWithWarnings =
+        warnings.length > 0 && response && typeof response === 'object' && !Array.isArray(response)
+          ? { ...(response as Record<string, unknown>), _mcp_warnings: warnings }
+          : response;
       
       return {
         toolResult: {
           content: [{ 
             type: 'text', 
-            text: JSON.stringify(response, null, 2) 
+            text: JSON.stringify(responseWithWarnings, null, 2) 
           }],
           isError: false
         }
       };
     } catch (error: any) {
-      const guidance = error.message.includes('404') || error.message.includes('Not Found')
-        ? '\nHint: The content type may not exist. Run discover_content_types to see available types.'
-        : '';
+      const message = error instanceof ContractValidationError || error instanceof ContractCompatibilityError
+        ? formatContractError(error)
+        : `Error creating content: ${error.message}`;
+
       return {
         toolResult: {
-          content: [{
-            type: 'text',
-            text: `Error creating content: ${error.message}${guidance}`
+          content: [{ 
+            type: 'text', 
+            text: message 
           }],
           isError: true
         }
@@ -710,54 +794,66 @@ export const unifiedContentHandlers = {
 
   update_content: async (params: UpdateContentParams) => {
     try {
-      const endpoint = await getContentEndpoint(params.content_type, params.site_id);
+      const input = await processWriteContent(params);
+      const preparedRequest = await prepareContentWriteRequest({
+        operation: 'update',
+        contentType: input.content_type,
+        siteId: input.site_id,
+        input
+      });
 
-      const updateData: any = {};
+      const response = await makeWordPressRequest(
+        'POST',
+        `${preparedRequest.endpoint}/${params.id}`,
+        preparedRequest.data,
+        {
+          siteId: params.site_id,
+          namespace: preparedRequest.namespace,
+          retry404With: preparedRequest.fallbackOn404
+        }
+      );
 
-      // Only include defined fields
-      if (params.title !== undefined) updateData.title = params.title;
-      if (params.content !== undefined) {
-        // Process content format (markdown -> HTML, optional block conversion)
-        updateData.content = await processContent(
-          params.content,
-          params.content_format || 'auto',
-          params.convert_to_blocks || false
-        );
+      const warnings: string[] = [];
+      const focusKeyword = readFocusKeywordForRankMathSync(preparedRequest.data, input);
+      if (focusKeyword) {
+        const rankMathActive = await isRankMathActive(false, params.site_id);
+        if (rankMathActive) {
+          try {
+            await syncRankMathFocusKeyword(params.id, focusKeyword, params.site_id);
+          } catch (error: any) {
+            const message = `Rank Math focus keyword sync failed: ${error.message}`;
+            warnings.push(message);
+            logToFile(message);
+          }
+        } else {
+          logToFile('Rank Math plugin is not active; skipping focus keyword sync.');
+        }
       }
-      if (params.status !== undefined) updateData.status = params.status;
-      if (params.excerpt !== undefined) updateData.excerpt = params.excerpt;
-      if (params.slug !== undefined) updateData.slug = params.slug;
-      if (params.author !== undefined) updateData.author = params.author;
-      if (params.parent !== undefined) updateData.parent = params.parent;
-      if (params.featured_media !== undefined) updateData.featured_media = params.featured_media;
-      if (params.format !== undefined) updateData.format = params.format;
-      if (params.menu_order !== undefined) updateData.menu_order = params.menu_order;
-      if (params.categories !== undefined) updateData.categories = params.categories;
-      if (params.tags !== undefined) updateData.tags = params.tags;
-      if (params.meta !== undefined) updateData.meta = params.meta;
-      
-      // Add custom fields
-      if (params.custom_fields) {
-        Object.assign(updateData, params.custom_fields);
-      }
-      
-      const response = await makeWordPressRequest('POST', `${endpoint}/${params.id}`, updateData, { siteId: params.site_id });
+
+      const responseWithWarnings =
+        warnings.length > 0 && response && typeof response === 'object' && !Array.isArray(response)
+          ? { ...(response as Record<string, unknown>), _mcp_warnings: warnings }
+          : response;
       
       return {
         toolResult: {
           content: [{ 
             type: 'text', 
-            text: JSON.stringify(response, null, 2) 
+            text: JSON.stringify(responseWithWarnings, null, 2) 
           }],
           isError: false
         }
       };
     } catch (error: any) {
+      const message = error instanceof ContractValidationError || error instanceof ContractCompatibilityError
+        ? formatContractError(error)
+        : `Error updating content: ${error.message}`;
+
       return {
         toolResult: {
           content: [{ 
             type: 'text', 
-            text: `Error updating content: ${error.message}` 
+            text: message 
           }],
           isError: true
         }
@@ -767,7 +863,7 @@ export const unifiedContentHandlers = {
 
   delete_content: async (params: DeleteContentParams) => {
     try {
-      const endpoint = await getContentEndpoint(params.content_type, params.site_id);
+      const endpoint = getContentEndpoint(params.content_type);
       
       const response = await makeWordPressRequest('DELETE', `${endpoint}/${params.id}`, {
         force: params.force || false
@@ -798,8 +894,10 @@ export const unifiedContentHandlers = {
   discover_content_types: async (params: DiscoverContentTypesParams) => {
     try {
       const contentTypes = await getPostTypes(params.refresh_cache || false, params.site_id);
+      const resolvedContracts = await listResolvedContentTypeContracts(params.site_id, params.refresh_cache || false);
       
       // Format the response to be more readable
+      const restSlugs = new Set(Object.keys(contentTypes));
       const formattedTypes = Object.entries(contentTypes).map(([slug, type]: [string, any]) => ({
         slug,
         name: type.name,
@@ -807,8 +905,33 @@ export const unifiedContentHandlers = {
         rest_base: type.rest_base,
         hierarchical: type.hierarchical,
         supports: type.supports,
-        taxonomies: type.taxonomies
+        taxonomies: type.taxonomies,
+        has_extended_schema: resolvedContracts.some(({ contract, executable }) => contract.slug === slug && executable),
+        contract_source: resolvedContracts.find(({ contract, executable }) => contract.slug === slug && executable)?.manifest.source || null,
+        contract_provider: resolvedContracts.find(({ contract, executable }) => contract.slug === slug && executable)?.manifest.provider || null,
+        preferred_write_mode: resolvedContracts.find(({ contract, executable }) => contract.slug === slug && executable)?.contract.preferred_write_mode || null,
+        interpreter_ready: resolvedContracts.find(({ contract }) => contract.slug === slug)?.executable || false
       }));
+
+      // Append contract-only types not visible in the REST API (e.g. show_in_rest = false)
+      for (const { contract, manifest, executable } of resolvedContracts) {
+        if (!restSlugs.has(contract.slug)) {
+          formattedTypes.push({
+            slug: contract.slug,
+            name: contract.label || contract.slug,
+            description: contract.description || `Contract-backed content type (${manifest.provider})`,
+            rest_base: contract.slug,
+            hierarchical: false,
+            supports: [],
+            taxonomies: [],
+            has_extended_schema: executable,
+            contract_source: manifest.source || null,
+            contract_provider: manifest.provider || null,
+            preferred_write_mode: contract.preferred_write_mode || null,
+            interpreter_ready: executable
+          });
+        }
+      }
       
       return {
         toolResult: {
@@ -825,6 +948,80 @@ export const unifiedContentHandlers = {
           content: [{ 
             type: 'text', 
             text: `Error discovering content types: ${error.message}` 
+          }],
+          isError: true
+        }
+      };
+    }
+  },
+
+  describe_content_type: async (params: DescribeContentTypeParams) => {
+    try {
+      const resolvedSiteId = siteManager.resolveSiteId(params.site_id);
+      const [contentTypes, contractResolution, manifestState] = await Promise.all([
+        getPostTypes(params.refresh_cache || false, resolvedSiteId),
+        resolveContentTypeContract(params.content_type, resolvedSiteId, params.refresh_cache || false),
+        loadSiteManifests(resolvedSiteId, params.refresh_cache || false)
+      ]);
+
+      const wordpressType = contentTypes[params.content_type];
+      const contractDescription =
+        contractResolution.contract && contractResolution.manifest
+          ? describeContractExecution(
+              contractResolution.contract,
+              contractResolution.manifest.provider,
+              contractResolution.manifest.schema_version,
+              contractResolution.executionSupport
+            )
+          : null;
+
+      const response = {
+        site_id: resolvedSiteId,
+        content_type: params.content_type,
+        wordpress: wordpressType
+          ? {
+              name: wordpressType.name,
+              description: wordpressType.description,
+              rest_base: wordpressType.rest_base,
+              hierarchical: wordpressType.hierarchical,
+              supports: wordpressType.supports,
+              taxonomies: wordpressType.taxonomies
+            }
+          : null,
+        contract: {
+          status: contractResolution.status,
+          has_extended_schema: contractResolution.status === 'supported',
+          interpreter_ready: contractResolution.executionSupport.executable,
+          message: contractResolution.message || null,
+          definition: contractResolution.contract || null,
+          source: contractResolution.manifest?.source || null,
+          provider: contractResolution.manifest?.provider || null,
+          description: contractDescription,
+          issues: contractResolution.issues,
+          execution_issues: contractResolution.executionSupport.issues
+        },
+        manifest_cache: {
+          fetched_at: manifestState.fetchedAt,
+          cache_hit: manifestState.cacheHit,
+          issues: manifestState.issues
+        }
+      };
+
+      return {
+        toolResult: {
+          content: [{
+            type: 'text',
+            text: JSON.stringify(response, null, 2)
+          }],
+          isError: false
+        }
+      };
+    } catch (error: any) {
+      return {
+        toolResult: {
+          content: [{
+            type: 'text',
+            text: `Error describing content type: ${error.message}`
           }],
           isError: true
         }
@@ -886,12 +1083,11 @@ export const unifiedContentHandlers = {
         
         // Update if requested
         if (params.update_fields) {
-          const endpoint = await getContentEndpoint(contentType, params.site_id);
-
+          const endpoint = getContentEndpoint(contentType);
+          
           const updateData: any = {};
           if (params.update_fields.title !== undefined) updateData.title = params.update_fields.title;
           if (params.update_fields.content !== undefined) {
-            // Process content format (markdown -> HTML, optional block conversion)
             updateData.content = await processContent(
               params.update_fields.content,
               params.update_fields.content_format || 'auto',
@@ -903,31 +1099,57 @@ export const unifiedContentHandlers = {
           if (params.update_fields.custom_fields !== undefined) {
             Object.assign(updateData, params.update_fields.custom_fields);
           }
-
+          
           const updatedContent = await makeWordPressRequest('POST', `${endpoint}/${content.id}`, updateData, { siteId: params.site_id });
-
+          const warnings: string[] = [];
+          const focusKeyword = readFocusKeywordForRankMathSync(
+            updateData,
+            {
+              meta: params.update_fields.meta,
+              custom_fields: params.update_fields.custom_fields
+            }
+          );
+          if (focusKeyword) {
+            const rankMathActive = await isRankMathActive(false, params.site_id);
+            if (rankMathActive) {
+              try {
+                await syncRankMathFocusKeyword(content.id, focusKeyword, params.site_id);
+              } catch (error: any) {
+                const message = `Rank Math focus keyword sync failed: ${error.message}`;
+                warnings.push(message);
+                logToFile(message);
+              }
+            } else {
+              logToFile('Rank Math plugin is not active; skipping focus keyword sync.');
+            }
+          }
+          const updatedContentWithWarnings =
+            warnings.length > 0 && updatedContent && typeof updatedContent === 'object' && !Array.isArray(updatedContent)
+              ? { ...(updatedContent as Record<string, unknown>), _mcp_warnings: warnings }
+              : updatedContent;
+          
           return {
             toolResult: {
-              content: [{
-                type: 'text',
+              content: [{ 
+                type: 'text', 
                 text: JSON.stringify({
                   found: true,
                   content_type: contentType,
                   content_id: content.id,
                   original_url: params.url,
                   updated: true,
-                  content: updatedContent
+                  content: updatedContentWithWarnings
                 }, null, 2)
               }],
               isError: false
             }
           };
         }
-
+        
         return {
           toolResult: {
-            content: [{
-              type: 'text',
+            content: [{ 
+              type: 'text', 
               text: JSON.stringify({
                 found: true,
                 content_type: contentType,
@@ -940,17 +1162,16 @@ export const unifiedContentHandlers = {
           }
         };
       }
-
+      
       const { content, contentType } = result;
-
+      
       // Update if requested
       if (params.update_fields) {
-        const endpoint = await getContentEndpoint(contentType, params.site_id);
-
+        const endpoint = getContentEndpoint(contentType);
+        
         const updateData: any = {};
         if (params.update_fields.title !== undefined) updateData.title = params.update_fields.title;
         if (params.update_fields.content !== undefined) {
-          // Process content format (markdown -> HTML, optional block conversion)
           updateData.content = await processContent(
             params.update_fields.content,
             params.update_fields.content_format || 'auto',
@@ -962,31 +1183,57 @@ export const unifiedContentHandlers = {
         if (params.update_fields.custom_fields !== undefined) {
           Object.assign(updateData, params.update_fields.custom_fields);
         }
-
+        
         const updatedContent = await makeWordPressRequest('POST', `${endpoint}/${content.id}`, updateData, { siteId: params.site_id });
-
+        const warnings: string[] = [];
+        const focusKeyword = readFocusKeywordForRankMathSync(
+          updateData,
+          {
+            meta: params.update_fields.meta,
+            custom_fields: params.update_fields.custom_fields
+          }
+        );
+        if (focusKeyword) {
+          const rankMathActive = await isRankMathActive(false, params.site_id);
+          if (rankMathActive) {
+            try {
+              await syncRankMathFocusKeyword(content.id, focusKeyword, params.site_id);
+            } catch (error: any) {
+              const message = `Rank Math focus keyword sync failed: ${error.message}`;
+              warnings.push(message);
+              logToFile(message);
+            }
+          } else {
+            logToFile('Rank Math plugin is not active; skipping focus keyword sync.');
+          }
+        }
+        const updatedContentWithWarnings =
+          warnings.length > 0 && updatedContent && typeof updatedContent === 'object' && !Array.isArray(updatedContent)
+            ? { ...(updatedContent as Record<string, unknown>), _mcp_warnings: warnings }
+            : updatedContent;
+        
         return {
           toolResult: {
-            content: [{
-              type: 'text',
+            content: [{ 
+              type: 'text', 
               text: JSON.stringify({
                 found: true,
                 content_type: contentType,
                 content_id: content.id,
                 original_url: params.url,
                 updated: true,
-                content: updatedContent
+                content: updatedContentWithWarnings
               }, null, 2)
             }],
             isError: false
           }
         };
       }
-
+      
       return {
         toolResult: {
-          content: [{
-            type: 'text',
+          content: [{ 
+            type: 'text', 
             text: JSON.stringify({
               found: true,
               content_type: contentType,
@@ -1045,3 +1292,75 @@ export const unifiedContentHandlers = {
     }
   }
 };
+
+function applyListContentResponseFilter(
+  response: unknown,
+  responseFilter?: {
+    eventStartAfter?: string;
+    eventStartBefore?: string;
+    eventStartOrder?: 'asc' | 'desc';
+  }
+): unknown {
+  if (
+    !responseFilter ||
+    !response ||
+    typeof response !== 'object' ||
+    Array.isArray(response)
+  ) {
+    return response;
+  }
+
+  const payload = response as Record<string, unknown>;
+  const events = Array.isArray(payload.events) ? payload.events : undefined;
+
+  if (!events) {
+    return response;
+  }
+
+  const filteredEvents = events
+    .filter((event) => {
+      if (!event || typeof event !== 'object' || Array.isArray(event)) {
+        return false;
+      }
+
+      const startDate = readEventStartDate(event as Record<string, unknown>);
+      if (!startDate) {
+        return false;
+      }
+
+      if (responseFilter.eventStartAfter && startDate < responseFilter.eventStartAfter) {
+        return false;
+      }
+
+      if (responseFilter.eventStartBefore && startDate >= responseFilter.eventStartBefore) {
+        return false;
+      }
+
+      return true;
+    })
+    .sort((left, right) => {
+      const leftDate = readEventStartDate(left as Record<string, unknown>) || '';
+      const rightDate = readEventStartDate(right as Record<string, unknown>) || '';
+      const comparison = leftDate.localeCompare(rightDate);
+      return responseFilter.eventStartOrder === 'desc' ? comparison * -1 : comparison;
+    });
+
+  return {
+    ...payload,
+    total: filteredEvents.length,
+    page: 1,
+    pages: 1,
+    per_page: filteredEvents.length,
+    events: filteredEvents
+  };
+}
+
+function readEventStartDate(event: Record<string, unknown>): string | undefined {
+  const startAt = typeof event.start_at === 'string' ? event.start_at : undefined;
+  if (startAt) {
+    return startAt.slice(0, 10);
+  }
+
+  const startDate = typeof event.start_date === 'string' ? event.start_date : undefined;
+  return startDate;
+}
