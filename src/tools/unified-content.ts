@@ -10,7 +10,12 @@ import { siteManager } from '../config/site-manager.js';
 import { listResolvedContentTypeContracts, resolveContentTypeContract } from '../adapters/registry.js';
 import { loadSiteManifests } from '../adapters/manifest-loader.js';
 import { describeContractExecution } from '../adapters/interpreter.js';
-import { formatContractError, prepareContentWriteRequest } from '../content/write-preparation.js';
+import {
+  attachContentIdToPreparedRequest,
+  formatContractError,
+  prepareContentDeleteRequest,
+  prepareContentWriteRequest
+} from '../content/write-preparation.js';
 import { getContentEndpoint } from '../content/utils.js';
 import { prepareGetContentRequest, prepareListContentRequest } from '../content/read-preparation.js';
 import { ContractCompatibilityError, ContractValidationError } from '../adapters/types.js';
@@ -801,15 +806,16 @@ export const unifiedContentHandlers = {
         siteId: input.site_id,
         input
       });
+      const itemRequest = attachContentIdToPreparedRequest(preparedRequest, params.id);
 
       const response = await makeWordPressRequest(
         'POST',
-        `${preparedRequest.endpoint}/${params.id}`,
-        preparedRequest.data,
+        itemRequest.endpoint,
+        itemRequest.data,
         {
           siteId: params.site_id,
-          namespace: preparedRequest.namespace,
-          retry404With: preparedRequest.fallbackOn404
+          namespace: itemRequest.namespace,
+          retry404With: itemRequest.fallbackOn404
         }
       );
 
@@ -863,11 +869,18 @@ export const unifiedContentHandlers = {
 
   delete_content: async (params: DeleteContentParams) => {
     try {
-      const endpoint = getContentEndpoint(params.content_type);
+      const preparedRequest = await prepareContentDeleteRequest({
+        contentType: params.content_type,
+        id: params.id,
+        siteId: params.site_id,
+        force: params.force
+      });
       
-      const response = await makeWordPressRequest('DELETE', `${endpoint}/${params.id}`, {
-        force: params.force || false
-      }, { siteId: params.site_id });
+      const response = await makeWordPressRequest('DELETE', preparedRequest.endpoint, preparedRequest.data, {
+        siteId: params.site_id,
+        namespace: preparedRequest.namespace,
+        retry404With: preparedRequest.fallbackOn404
+      });
       
       return {
         toolResult: {

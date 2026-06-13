@@ -17,6 +17,11 @@ export function removeUndefinedValues<T extends Record<string, unknown>>(value: 
   return value;
 }
 
+export function appendEndpointId(endpoint: string, id: number): string {
+  const normalized = endpoint.replace(/^\/+|\/+$/g, '');
+  return `${normalized}/${id}`;
+}
+
 export function splitNamespacedEndpoint(
   endpoint: string | undefined,
   fallbackEndpoint: string

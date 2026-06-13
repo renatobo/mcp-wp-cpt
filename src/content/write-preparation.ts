@@ -8,7 +8,12 @@ import {
   ContractValidationError,
   PreparedContentRequest
 } from '../adapters/types.js';
-import { getContentEndpoint, getDefensiveEndpointFallback } from './utils.js';
+import {
+  appendEndpointId,
+  getContentEndpoint,
+  getDefensiveEndpointFallback,
+  splitNamespacedEndpoint
+} from './utils.js';
 import { buildBaseContentPayload } from './payloads.js';
 
 export interface PrepareContentWriteRequestArgs {
@@ -20,6 +25,25 @@ export interface PrepareContentWriteRequestArgs {
 }
 
 export interface PreparedContentWriteRequest extends PreparedContentRequest {
+  contractResolution: ContractResolution;
+}
+
+export interface PrepareContentDeleteRequestArgs {
+  contentType: string;
+  id: number;
+  siteId?: string;
+  force?: boolean;
+  refreshCache?: boolean;
+}
+
+export interface BuildContentDeleteRequestArgs {
+  contentType: string;
+  id: number;
+  force?: boolean;
+  contractResolution: ContractResolution;
+}
+
+export interface PreparedContentDeleteRequest extends PreparedContentRequest {
   contractResolution: ContractResolution;
 }
 
@@ -81,6 +105,83 @@ export async function prepareContentWriteRequest(
     }),
     data: buildBaseContentPayload(args.input, args.operation),
     contractResolution
+  };
+}
+
+export async function prepareContentDeleteRequest(
+  args: PrepareContentDeleteRequestArgs
+): Promise<PreparedContentDeleteRequest> {
+  const contractResolution = await resolveContentTypeContract(
+    args.contentType,
+    args.siteId,
+    args.refreshCache
+  );
+
+  return buildContentDeleteRequest({
+    contentType: args.contentType,
+    id: args.id,
+    force: args.force,
+    contractResolution
+  });
+}
+
+export function attachContentIdToPreparedRequest(
+  preparedRequest: PreparedContentRequest,
+  id: number
+): PreparedContentRequest {
+  return {
+    ...preparedRequest,
+    endpoint: appendEndpointId(preparedRequest.endpoint, id),
+    fallbackOn404: preparedRequest.fallbackOn404
+      ? {
+          ...preparedRequest.fallbackOn404,
+          endpoint: appendEndpointId(preparedRequest.fallbackOn404.endpoint, id)
+        }
+      : undefined
+  };
+}
+
+export function buildContentDeleteRequest(
+  args: BuildContentDeleteRequestArgs
+): PreparedContentDeleteRequest {
+  const fallbackEndpoint = getContentEndpoint(args.contentType);
+  let endpoint = fallbackEndpoint;
+  let namespace: string | undefined;
+  let fallbackOn404: PreparedContentRequest['fallbackOn404'];
+
+  if (args.contractResolution.contract?.preferred_endpoint && args.contractResolution.manifest) {
+    const split = splitNamespacedEndpoint(
+      args.contractResolution.contract.preferred_endpoint,
+      fallbackEndpoint
+    );
+    endpoint = split.endpoint;
+    namespace = split.namespace;
+    fallbackOn404 = getDefensiveEndpointFallback({
+      contentType: args.contentType,
+      provider: args.contractResolution.manifest.provider,
+      endpoint,
+      namespace
+    });
+  } else {
+    fallbackOn404 = getDefensiveEndpointFallback({
+      contentType: args.contentType,
+      provider: args.contractResolution.manifest?.provider,
+      endpoint
+    });
+  }
+
+  const preparedRequest: PreparedContentRequest = {
+    endpoint,
+    namespace,
+    fallbackOn404,
+    data: {
+      force: args.force || false
+    }
+  };
+
+  return {
+    ...attachContentIdToPreparedRequest(preparedRequest, args.id),
+    contractResolution: args.contractResolution
   };
 }
 

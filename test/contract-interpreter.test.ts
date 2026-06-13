@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { assessContractExecutionSupport, prepareContractWriteRequest } from '../src/adapters/interpreter.js';
+import { attachContentIdToPreparedRequest } from '../src/content/write-preparation.js';
 import {
   ContentTypeContract,
   ContractValidationError,
@@ -121,6 +122,34 @@ test('contract interpreter validates and normalizes structured create input', ()
   assert.deepEqual(prepared.data.organizers, [{ name: 'Renato' }]);
   assert.deepEqual(prepared.data.virtual, { enabled: true });
   assert.deepEqual(prepared.data.location, { name: 'HQ' });
+});
+
+test('contract update requests append the content ID to primary and fallback endpoints', () => {
+  const prepared = prepareContractWriteRequest(
+    {
+      title: 'Updated Launch Party',
+      fields: {
+        end_date: '2026-04-01',
+        end_time: '21:00'
+      }
+    },
+    {
+      siteId: 'default',
+      contentType: 'ajde_events',
+      operation: 'update',
+      manifest,
+      contract
+    }
+  );
+
+  const itemRequest = attachContentIdToPreparedRequest(prepared, 123);
+
+  assert.equal(itemRequest.endpoint, 'ajde_events/123');
+  assert.equal(itemRequest.namespace, 'wp/v2');
+  assert.deepEqual(itemRequest.fallbackOn404, {
+    endpoint: 'events/123',
+    namespace: 'eventonapify/v1'
+  });
 });
 
 test('contract interpreter returns actionable validation errors', () => {
