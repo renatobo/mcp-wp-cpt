@@ -97,14 +97,28 @@ export function buildListContentRequest(
     return buildDirectContractReadRequest(queryParams, contractResolution);
   }
 
-  return {
-    endpoint: getContentEndpoint(contractResolution.contentType),
-    fallbackOn404: getDefensiveEndpointFallback({
-      contentType: contractResolution.contentType,
-      provider: contractResolution.manifest?.provider,
-      endpoint: getContentEndpoint(contractResolution.contentType)
-    }),
+  // No contract resolved: still route through getPreferredReadEndpoint so EventON
+  // ajde_events lists hit the plugin events endpoint and get start-date semantics for
+  // after/before. For every other type this is a no-op (endpoint/namespace unchanged,
+  // same defensive 404 fallback).
+  const fallbackEndpoint = getContentEndpoint(contractResolution.contentType);
+  const preferredRead = getPreferredReadEndpoint({
+    contentType: contractResolution.contentType,
+    provider: contractResolution.manifest?.provider,
+    endpoint: fallbackEndpoint
+  });
+  const responseFilter = normalizeContractListQueryParamsForRead(
     queryParams,
+    contractResolution,
+    preferredRead
+  );
+
+  return {
+    endpoint: preferredRead.endpoint,
+    namespace: preferredRead.namespace,
+    fallbackOn404: preferredRead.fallbackOn404,
+    queryParams,
+    responseFilter,
     contractResolution
   };
 }
@@ -243,9 +257,11 @@ function normalizeContractListQueryParamsForRead(
     namespace?: string;
   }
 ): PreparedListContentRequest['responseFilter'] | undefined {
+  // The resolved read endpoint is the authoritative signal: getPreferredReadEndpoint
+  // only returns eventonapify/v1/events for ajde_events, so no provider check is
+  // needed and this also covers the no-contract fallback path.
   const isEventOnEventList =
     contractResolution.contentType === 'ajde_events' &&
-    contractResolution.manifest?.provider === 'eventon-apify' &&
     preferredRead.namespace === 'eventonapify/v1' &&
     preferredRead.endpoint === 'events';
 

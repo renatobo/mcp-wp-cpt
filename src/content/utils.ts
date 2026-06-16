@@ -143,8 +143,11 @@ export function getPreferredReadEndpoint(args: {
   const endpoint = args.endpoint.replace(/^\/+|\/+$/g, '');
   const namespace = args.namespace || 'wp/v2';
 
+  // Route EventON event lists/reads to the plugin events endpoint by content type
+  // alone (mirroring getDefensiveEndpointFallback). The provider is only known when
+  // a manifest resolves, but ajde_events must use this endpoint even when it does not,
+  // so after/before map to event start dates instead of the WordPress publish date.
   if (
-    args.provider === 'eventon-apify' &&
     args.contentType === 'ajde_events' &&
     namespace === 'wp/v2' &&
     endpoint === 'ajde_events'
