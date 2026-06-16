@@ -541,6 +541,37 @@ async function processWriteContent<T extends { content?: string; content_format?
   };
 }
 
+// Resolve an update's body before the contract pipeline runs. When content_edit
+// is supplied, fetch the existing raw content (contract-aware), apply the targeted
+// edit, and hand the finished body to the pipeline so partial edits work uniformly
+// across content types — including contract-backed ones. Otherwise fall back to the
+// generic content processing used for full-document writes.
+async function resolveWriteInput(params: UpdateContentParams): Promise<UpdateContentParams> {
+  if (params.content_edit === undefined) {
+    return processWriteContent(params);
+  }
+
+  if (params.content !== undefined) {
+    throw new Error('Provide either content or content_edit, not both');
+  }
+
+  const edit = params.content_edit as ContentEditParams;
+  validateContentEdit(edit);
+
+  const existingRaw = await fetchEditableRawContentForType(params.content_type, params.id, params.site_id);
+  const processedFragment = await processContent(
+    edit.value,
+    edit.content_format || 'auto',
+    edit.convert_to_blocks || false
+  );
+  const mergedContent = applyContentEdit(existingRaw, { ...edit, value: processedFragment });
+
+  // The merged body is already in final WordPress form; strip the edit and format
+  // hints so the contract pipeline forwards it verbatim instead of reprocessing.
+  const { content_edit, content_format, convert_to_blocks, ...rest } = params as any;
+  return { ...rest, content: mergedContent } as UpdateContentParams;
+}
+
 // Return the meta keys that were sent in the request but don't appear in
 // the WP response's `meta` object. WordPress silently drops unregistered
 // meta keys on writes to /wp/v2/{type}/{id}, so absence in the echoed
@@ -624,7 +655,7 @@ function getTargetMatchIndex(content: string, targetText: string, occurrence?: n
   return resolvedIndex;
 }
 
-function applyContentEdit(existingContent: string, edit: ContentEditParams): string {
+export function applyContentEdit(existingContent: string, edit: ContentEditParams): string {
   validateContentEdit(edit);
 
   switch (edit.operation) {
@@ -654,6 +685,32 @@ async function getEditableRawContent(endpoint: string, id: number, siteId?: stri
   const response = await fetchContentById(endpoint, id, siteId, true);
 
   const rawContent = response?.content?.raw;
+  if (typeof rawContent !== 'string') {
+    throw new Error('Partial content edits require WordPress edit access and a REST response that includes content.raw');
+  }
+
+  return rawContent;
+}
+
+// Contract-aware variant of getEditableRawContent: resolves the read endpoint
+// (and 404 fallback) the same way get_content does, so partial edits and raw
+// reads work for content types that aren't on wp/v2 (e.g. EventON ajde_events).
+async function fetchEditableRawContentForType(contentType: string, id: number, siteId?: string): Promise<string> {
+  const preparedRequest = await prepareGetContentRequest({ contentType, siteId });
+  const fallbackOn404 = preparedRequest.fallbackOn404
+    ? {
+        endpoint: `${preparedRequest.fallbackOn404.endpoint}/${id}`,
+        namespace: preparedRequest.fallbackOn404.namespace
+      }
+    : undefined;
+  const response = await makeWordPressRequest(
+    'GET',
+    `${preparedRequest.endpoint}/${id}`,
+    { context: 'edit' },
+    { siteId, namespace: preparedRequest.namespace, retry404With: fallbackOn404 }
+  );
+
+  const rawContent = (response as any)?.content?.raw;
   if (typeof rawContent !== 'string') {
     throw new Error('Partial content edits require WordPress edit access and a REST response that includes content.raw');
   }
@@ -1146,18 +1203,28 @@ export const unifiedContentHandlers = {
         contentType: params.content_type,
         siteId: params.site_id
       });
-      const response = await makeWordPressRequest('GET', `${preparedRequest.endpoint}/${params.id}`, undefined, {
-        siteId: params.site_id,
-        namespace: preparedRequest.namespace,
-        retry404With: preparedRequest.fallbackOn404
-      });
+      const response = await makeWordPressRequest(
+        'GET',
+        `${preparedRequest.endpoint}/${params.id}`,
+        params.include_raw_content ? { context: 'edit' } : undefined,
+        {
+          siteId: params.site_id,
+          namespace: preparedRequest.namespace,
+          retry404With: preparedRequest.fallbackOn404
+        }
+      );
 
+      // include_raw_content surfaces a top-level content_raw alias for exact
+      // partial-edit targeting, while keeping the contract-aware read routing.
+      const finalResponse = params.include_raw_content && response && typeof response === 'object'
+        ? withContentRawAlias(response as Record<string, any>)
+        : response;
 
       return {
         toolResult: {
-          content: [{ 
-            type: 'text', 
-            text: JSON.stringify(response, null, 2) 
+          content: [{
+            type: 'text',
+            text: JSON.stringify(finalResponse, null, 2)
           }],
           isError: false
         }
@@ -1165,9 +1232,9 @@ export const unifiedContentHandlers = {
     } catch (error: any) {
       return {
         toolResult: {
-          content: [{ 
-            type: 'text', 
-            text: `Error getting content: ${error.message}` 
+          content: [{
+            type: 'text',
+            text: `Error getting content: ${error.message}`
           }],
           isError: true
         }
@@ -1246,7 +1313,7 @@ export const unifiedContentHandlers = {
 
   update_content: async (params: UpdateContentParams) => {
     try {
-      const input = await processWriteContent(params);
+      const input = await resolveWriteInput(params);
       const preparedRequest = await prepareContentWriteRequest({
         operation: 'update',
         contentType: input.content_type,
