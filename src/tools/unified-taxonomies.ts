@@ -1,28 +1,33 @@
 // src/tools/unified-taxonomies.ts
 import { Tool } from '@modelcontextprotocol/sdk/types.js';
 import { makeWordPressRequest, logToFile } from '../wordpress.js';
+import { getContentEndpoint } from './unified-content.js';
 import { z } from 'zod';
 import { prepareGetContentRequest } from '../content/read-preparation.js';
 
-// Cache for taxonomies to reduce API calls (keyed per site)
-const taxonomiesCache = new Map<string, { value: any; timestamp: number }>();
+// Cache for taxonomies, keyed per site, to reduce API calls
+interface TaxonomyCacheEntry {
+  data: any;
+  timestamp: number;
+}
+const taxonomiesCache = new Map<string, TaxonomyCacheEntry>();
 const CACHE_DURATION = 5 * 60 * 1000; // 5 minutes
 
-// Helper function to get all taxonomies with caching
+// Helper function to get all taxonomies for a site with caching
 async function getTaxonomies(forceRefresh = false, siteId?: string) {
-  const now = Date.now();
   const cacheKey = siteId || '__default__';
+  const now = Date.now();
   const cached = taxonomiesCache.get(cacheKey);
 
   if (!forceRefresh && cached && (now - cached.timestamp) < CACHE_DURATION) {
     logToFile('Using cached taxonomies');
-    return cached.value;
+    return cached.data;
   }
 
   try {
     logToFile('Fetching taxonomies from API');
     const response = await makeWordPressRequest('GET', 'taxonomies', undefined, { siteId });
-    taxonomiesCache.set(cacheKey, { value: response, timestamp: now });
+    taxonomiesCache.set(cacheKey, { data: response, timestamp: now });
     return response;
   } catch (error: any) {
     logToFile(`Error fetching taxonomies: ${error.message}`);
@@ -130,37 +135,54 @@ export function extractPluginObjectTerms(content: any, taxonomy?: string): Recor
   return terms;
 }
 
-// Helper function to get the correct endpoint for a taxonomy
-function getTaxonomyEndpoint(taxonomy: string): string {
-  const endpointMap: Record<string, string> = {
-    'category': 'categories',
-    'post_tag': 'tags',
-    'nav_menu': 'menus',
-    'link_category': 'link_categories'
+/**
+ * Resolve a taxonomy identifier (slug or rest_base) to its canonical slug and
+ * rest_base via the site's /wp/v2/taxonomies response.
+ *
+ * WordPress only guarantees rest_base === slug for built-ins; any
+ * register_taxonomy() call can set a different rest_base (e.g. slug
+ * "documentation_category" with rest_base "documentation-categories").
+ * The REST field name on post objects and the term endpoint both use
+ * rest_base, so every code path must route through this resolver.
+ *
+ * Hard-errors on unknown taxonomies: a silent slug fallback is what
+ * previously let writes report success while writing nothing.
+ */
+async function resolveTaxonomy(input: string, siteId?: string): Promise<{ slug: string; restBase: string }> {
+  const findIn = (taxonomies: any) => {
+    for (const [slug, info] of Object.entries<any>(taxonomies)) {
+      if (slug === input || info.rest_base === input) {
+        return { slug, restBase: info.rest_base || slug };
+      }
+    }
+    return null;
   };
-  
-  return endpointMap[taxonomy] || taxonomy;
-}
 
-// Helper function to get the correct content endpoint
-function getContentEndpoint(contentType: string): string {
-  const endpointMap: Record<string, string> = {
-    'post': 'posts',
-    'page': 'pages'
-  };
-  
-  return endpointMap[contentType] || contentType;
+  let match = findIn(await getTaxonomies(false, siteId));
+  if (match) return match;
+
+  // Refresh once in case the taxonomy was registered after the cache was filled
+  const fresh = await getTaxonomies(true, siteId);
+  match = findIn(fresh);
+  if (match) return match;
+
+  const available = Object.entries<any>(fresh)
+    .map(([slug, info]) => (info.rest_base && info.rest_base !== slug ? `${slug} (rest_base: ${info.rest_base})` : slug))
+    .join(', ');
+  throw new Error(`Unknown taxonomy "${input}" — not found in /wp/v2/taxonomies. Available: ${available}`);
 }
 
 // Schema definitions
+const siteIdSchema = z.string().optional().describe("Site ID (for multi-site setups). Uses the default site if omitted.");
+
 const discoverTaxonomiesSchema = z.object({
   content_type: z.string().optional().describe("Limit results to taxonomies associated with a specific content type"),
   refresh_cache: z.boolean().optional().describe("Force refresh the taxonomies cache"),
-  site_id: z.string().optional().describe("Site ID (for multi-site setups)")
+  site_id: siteIdSchema
 });
 
 const listTermsSchema = z.object({
-  taxonomy: z.string().describe("The taxonomy slug (e.g., 'category', 'post_tag', or custom taxonomies)"),
+  taxonomy: z.string().describe("The taxonomy slug or rest_base (e.g., 'category', 'post_tag', or custom taxonomies)"),
   page: z.number().optional().describe("Page number (default 1)"),
   per_page: z.number().min(1).max(100).optional().describe("Items per page (default 10, max 100)"),
   search: z.string().optional().describe("Search term for term name"),
@@ -169,57 +191,57 @@ const listTermsSchema = z.object({
   hide_empty: z.boolean().optional().describe("Whether to hide terms not assigned to any content"),
   orderby: z.enum(['id', 'include', 'name', 'slug', 'term_group', 'description', 'count']).optional().describe("Sort terms by parameter"),
   order: z.enum(['asc', 'desc']).optional().describe("Order sort attribute"),
-  site_id: z.string().optional().describe("Site ID (for multi-site setups)")
+  site_id: siteIdSchema
 });
 
 const getTermSchema = z.object({
-  taxonomy: z.string().describe("The taxonomy slug"),
+  taxonomy: z.string().describe("The taxonomy slug or rest_base"),
   id: z.number().describe("Term ID"),
-  site_id: z.string().optional().describe("Site ID (for multi-site setups)")
+  site_id: siteIdSchema
 });
 
 const createTermSchema = z.object({
-  taxonomy: z.string().describe("The taxonomy slug"),
+  taxonomy: z.string().describe("The taxonomy slug or rest_base"),
   name: z.string().describe("Term name"),
   slug: z.string().optional().describe("Term slug"),
   parent: z.number().optional().describe("Parent term ID"),
   description: z.string().optional().describe("Term description"),
   meta: z.record(z.string(), z.any()).optional().describe("Term meta fields"),
-  site_id: z.string().optional().describe("Site ID (for multi-site setups)")
+  site_id: siteIdSchema
 });
 
 const updateTermSchema = z.object({
-  taxonomy: z.string().describe("The taxonomy slug"),
+  taxonomy: z.string().describe("The taxonomy slug or rest_base"),
   id: z.number().describe("Term ID"),
   name: z.string().optional().describe("Term name"),
   slug: z.string().optional().describe("Term slug"),
   parent: z.number().optional().describe("Parent term ID"),
   description: z.string().optional().describe("Term description"),
   meta: z.record(z.string(), z.any()).optional().describe("Term meta fields"),
-  site_id: z.string().optional().describe("Site ID (for multi-site setups)")
+  site_id: siteIdSchema
 });
 
 const deleteTermSchema = z.object({
-  taxonomy: z.string().describe("The taxonomy slug"),
+  taxonomy: z.string().describe("The taxonomy slug or rest_base"),
   id: z.number().describe("Term ID"),
   force: z.boolean().optional().describe("Required to be true, as terms do not support trashing"),
-  site_id: z.string().optional().describe("Site ID (for multi-site setups)")
+  site_id: siteIdSchema
 });
 
 const assignTermsToContentSchema = z.object({
   content_id: z.number().describe("The content ID"),
   content_type: z.string().describe("The content type slug"),
-  taxonomy: z.string().describe("The taxonomy slug"),
-  terms: z.array(z.union([z.number(), z.string()])).describe("Array of term IDs or slugs to assign"),
+  taxonomy: z.string().describe("The taxonomy slug or rest_base"),
+  terms: z.array(z.number()).describe("Array of term IDs to assign"),
   append: z.boolean().optional().describe("If true, append terms to existing ones. If false, replace all terms"),
-  site_id: z.string().optional().describe("Site ID (for multi-site setups)")
+  site_id: siteIdSchema
 });
 
 const getContentTermsSchema = z.object({
   content_id: z.number().describe("The content ID"),
   content_type: z.string().describe("The content type slug"),
-  taxonomy: z.string().optional().describe("Specific taxonomy to retrieve terms from (if not specified, returns all)"),
-  site_id: z.string().optional().describe("Site ID (for multi-site setups)")
+  taxonomy: z.string().optional().describe("Specific taxonomy (slug or rest_base) to retrieve terms from (if not specified, returns all)"),
+  site_id: siteIdSchema
 });
 
 // Type definitions
@@ -235,7 +257,7 @@ type GetContentTermsParams = z.infer<typeof getContentTermsSchema>;
 export const unifiedTaxonomyTools: Tool[] = [
   {
     name: "discover_taxonomies",
-    description: "Discovers all available taxonomies (built-in and custom) in the WordPress site",
+    description: "Discovers all available taxonomies (built-in and custom) in the WordPress site, including each taxonomy's rest_base",
     inputSchema: { type: "object", properties: discoverTaxonomiesSchema.shape }
   },
   {
@@ -265,7 +287,7 @@ export const unifiedTaxonomyTools: Tool[] = [
   },
   {
     name: "assign_terms_to_content",
-    description: "Assigns taxonomy terms to content of any type",
+    description: "Assigns taxonomy terms to content of any type. Verifies the write against the WordPress response and errors if the terms were not actually saved.",
     inputSchema: { type: "object", properties: assignTermsToContentSchema.shape }
   },
   {
@@ -284,12 +306,12 @@ export const unifiedTaxonomyHandlers = {
       let filteredTaxonomies = taxonomies;
       if (params.content_type) {
         filteredTaxonomies = Object.fromEntries(
-          Object.entries(taxonomies).filter(([_, tax]: [string, any]) => 
+          Object.entries(taxonomies).filter(([_, tax]: [string, any]) =>
             tax.types && tax.types.includes(params.content_type)
           )
         );
       }
-      
+
       // Format the response to be more readable
       const formattedTaxonomies = Object.entries(filteredTaxonomies).map(([slug, tax]: [string, any]) => ({
         slug,
@@ -300,12 +322,12 @@ export const unifiedTaxonomyHandlers = {
         rest_base: tax.rest_base,
         labels: tax.labels
       }));
-      
+
       return {
         toolResult: {
-          content: [{ 
-            type: 'text', 
-            text: JSON.stringify(formattedTaxonomies, null, 2) 
+          content: [{
+            type: 'text',
+            text: JSON.stringify(formattedTaxonomies, null, 2)
           }],
           isError: false
         }
@@ -313,9 +335,9 @@ export const unifiedTaxonomyHandlers = {
     } catch (error: any) {
       return {
         toolResult: {
-          content: [{ 
-            type: 'text', 
-            text: `Error discovering taxonomies: ${error.message}` 
+          content: [{
+            type: 'text',
+            text: `Error discovering taxonomies: ${error.message}`
           }],
           isError: true
         }
@@ -325,16 +347,16 @@ export const unifiedTaxonomyHandlers = {
 
   list_terms: async (params: ListTermsParams) => {
     try {
-      const endpoint = getTaxonomyEndpoint(params.taxonomy);
+      const { restBase } = await resolveTaxonomy(params.taxonomy, params.site_id);
       const { taxonomy, site_id, ...queryParams } = params;
 
-      const response = await makeWordPressRequest('GET', endpoint, queryParams, { siteId: site_id });
-      
+      const response = await makeWordPressRequest('GET', restBase, queryParams, { siteId: site_id });
+
       return {
         toolResult: {
-          content: [{ 
-            type: 'text', 
-            text: JSON.stringify(response, null, 2) 
+          content: [{
+            type: 'text',
+            text: JSON.stringify(response, null, 2)
           }],
           isError: false
         }
@@ -342,9 +364,9 @@ export const unifiedTaxonomyHandlers = {
     } catch (error: any) {
       return {
         toolResult: {
-          content: [{ 
-            type: 'text', 
-            text: `Error listing terms: ${error.message}` 
+          content: [{
+            type: 'text',
+            text: `Error listing terms: ${error.message}`
           }],
           isError: true
         }
@@ -354,15 +376,15 @@ export const unifiedTaxonomyHandlers = {
 
   get_term: async (params: GetTermParams) => {
     try {
-      const endpoint = getTaxonomyEndpoint(params.taxonomy);
+      const { restBase } = await resolveTaxonomy(params.taxonomy, params.site_id);
 
-      const response = await makeWordPressRequest('GET', `${endpoint}/${params.id}`, undefined, { siteId: params.site_id });
-      
+      const response = await makeWordPressRequest('GET', `${restBase}/${params.id}`, undefined, { siteId: params.site_id });
+
       return {
         toolResult: {
-          content: [{ 
-            type: 'text', 
-            text: JSON.stringify(response, null, 2) 
+          content: [{
+            type: 'text',
+            text: JSON.stringify(response, null, 2)
           }],
           isError: false
         }
@@ -370,9 +392,9 @@ export const unifiedTaxonomyHandlers = {
     } catch (error: any) {
       return {
         toolResult: {
-          content: [{ 
-            type: 'text', 
-            text: `Error getting term: ${error.message}` 
+          content: [{
+            type: 'text',
+            text: `Error getting term: ${error.message}`
           }],
           isError: true
         }
@@ -382,24 +404,24 @@ export const unifiedTaxonomyHandlers = {
 
   create_term: async (params: CreateTermParams) => {
     try {
-      const endpoint = getTaxonomyEndpoint(params.taxonomy);
-      
+      const { restBase } = await resolveTaxonomy(params.taxonomy, params.site_id);
+
       const termData: any = {
         name: params.name
       };
-      
+
       if (params.slug !== undefined) termData.slug = params.slug;
       if (params.parent !== undefined) termData.parent = params.parent;
       if (params.description !== undefined) termData.description = params.description;
       if (params.meta !== undefined) termData.meta = params.meta;
 
-      const response = await makeWordPressRequest('POST', endpoint, termData, { siteId: params.site_id });
-      
+      const response = await makeWordPressRequest('POST', restBase, termData, { siteId: params.site_id });
+
       return {
         toolResult: {
-          content: [{ 
-            type: 'text', 
-            text: JSON.stringify(response, null, 2) 
+          content: [{
+            type: 'text',
+            text: JSON.stringify(response, null, 2)
           }],
           isError: false
         }
@@ -407,9 +429,9 @@ export const unifiedTaxonomyHandlers = {
     } catch (error: any) {
       return {
         toolResult: {
-          content: [{ 
-            type: 'text', 
-            text: `Error creating term: ${error.message}` 
+          content: [{
+            type: 'text',
+            text: `Error creating term: ${error.message}`
           }],
           isError: true
         }
@@ -419,23 +441,23 @@ export const unifiedTaxonomyHandlers = {
 
   update_term: async (params: UpdateTermParams) => {
     try {
-      const endpoint = getTaxonomyEndpoint(params.taxonomy);
-      
+      const { restBase } = await resolveTaxonomy(params.taxonomy, params.site_id);
+
       const updateData: any = {};
-      
+
       if (params.name !== undefined) updateData.name = params.name;
       if (params.slug !== undefined) updateData.slug = params.slug;
       if (params.parent !== undefined) updateData.parent = params.parent;
       if (params.description !== undefined) updateData.description = params.description;
       if (params.meta !== undefined) updateData.meta = params.meta;
 
-      const response = await makeWordPressRequest('POST', `${endpoint}/${params.id}`, updateData, { siteId: params.site_id });
-      
+      const response = await makeWordPressRequest('POST', `${restBase}/${params.id}`, updateData, { siteId: params.site_id });
+
       return {
         toolResult: {
-          content: [{ 
-            type: 'text', 
-            text: JSON.stringify(response, null, 2) 
+          content: [{
+            type: 'text',
+            text: JSON.stringify(response, null, 2)
           }],
           isError: false
         }
@@ -443,9 +465,9 @@ export const unifiedTaxonomyHandlers = {
     } catch (error: any) {
       return {
         toolResult: {
-          content: [{ 
-            type: 'text', 
-            text: `Error updating term: ${error.message}` 
+          content: [{
+            type: 'text',
+            text: `Error updating term: ${error.message}`
           }],
           isError: true
         }
@@ -455,17 +477,17 @@ export const unifiedTaxonomyHandlers = {
 
   delete_term: async (params: DeleteTermParams) => {
     try {
-      const endpoint = getTaxonomyEndpoint(params.taxonomy);
-      
-      const response = await makeWordPressRequest('DELETE', `${endpoint}/${params.id}`, {
+      const { restBase } = await resolveTaxonomy(params.taxonomy, params.site_id);
+
+      const response = await makeWordPressRequest('DELETE', `${restBase}/${params.id}`, {
         force: true // Terms require force to be true
       }, { siteId: params.site_id });
-      
+
       return {
         toolResult: {
-          content: [{ 
-            type: 'text', 
-            text: JSON.stringify(response, null, 2) 
+          content: [{
+            type: 'text',
+            text: JSON.stringify(response, null, 2)
           }],
           isError: false
         }
@@ -473,9 +495,9 @@ export const unifiedTaxonomyHandlers = {
     } catch (error: any) {
       return {
         toolResult: {
-          content: [{ 
-            type: 'text', 
-            text: `Error deleting term: ${error.message}` 
+          content: [{
+            type: 'text',
+            text: `Error deleting term: ${error.message}`
           }],
           isError: true
         }
@@ -485,42 +507,48 @@ export const unifiedTaxonomyHandlers = {
 
   assign_terms_to_content: async (params: AssignTermsToContentParams) => {
     try {
-      // Determine the content endpoint
-      const contentEndpoint = getContentEndpoint(params.content_type);
-      
-      // Prepare the update data
-      const updateData: any = {};
-      
-      // The field name depends on the taxonomy
-      if (params.taxonomy === 'category') {
-        updateData.categories = params.terms;
-      } else if (params.taxonomy === 'post_tag') {
-        updateData.tags = params.terms;
-      } else {
-        // For custom taxonomies, use the taxonomy slug as the field name
-        updateData[params.taxonomy] = params.terms;
-      }
-      
-      // If appending, we need to get current terms first
+      // The REST field on a post object is the taxonomy's rest_base, not its
+      // slug (for built-ins they coincide: categories/tags). Sending an
+      // unknown field is silently ignored by WordPress, so resolving here is
+      // what makes the write actually land.
+      const { slug, restBase } = await resolveTaxonomy(params.taxonomy, params.site_id);
+      const contentEndpoint = await getContentEndpoint(params.content_type, params.site_id);
+
+      let termsToAssign = [...params.terms];
+
+      // If appending, merge with the content's current terms
       if (params.append) {
         try {
           const currentContent = await makeWordPressRequest('GET', `${contentEndpoint}/${params.content_id}`, undefined, { siteId: params.site_id });
-          const currentTerms = currentContent[params.taxonomy === 'category' ? 'categories' : 
-                                              params.taxonomy === 'post_tag' ? 'tags' : 
-                                              params.taxonomy] || [];
-          
-          // Merge current terms with new terms (remove duplicates)
-          const allTerms = [...new Set([...currentTerms, ...params.terms])];
-          updateData[params.taxonomy === 'category' ? 'categories' : 
-                     params.taxonomy === 'post_tag' ? 'tags' : 
-                     params.taxonomy] = allTerms;
+          const currentTerms: number[] = currentContent[restBase] || [];
+          termsToAssign = [...new Set([...currentTerms, ...params.terms])];
         } catch (error) {
           // If we can't get current terms, just set the new ones
           logToFile(`Warning: Could not get current terms for append operation: ${error}`);
         }
       }
-      
+
+      const updateData = { [restBase]: termsToAssign };
       const response = await makeWordPressRequest('POST', `${contentEndpoint}/${params.content_id}`, updateData, { siteId: params.site_id });
+
+      // Derive success from the response, not the request: WordPress returns
+      // 200 even when it ignored the field entirely.
+      const savedTerms: number[] | undefined = Array.isArray(response[restBase]) ? response[restBase] : undefined;
+      const missing = savedTerms === undefined
+        ? params.terms
+        : params.terms.filter(id => !savedTerms.includes(id));
+
+      if (missing.length > 0) {
+        return {
+          toolResult: {
+            content: [{
+              type: 'text',
+              text: `Error: assignment did not stick. Requested term(s) [${params.terms.join(', ')}] for taxonomy "${slug}" (field "${restBase}"), but the updated content reports ${savedTerms === undefined ? `no "${restBase}" field — the taxonomy may not be registered for content type "${params.content_type}" or not exposed in REST` : `[${savedTerms.join(', ')}]`}. Nothing was reported as saved for: [${missing.join(', ')}].`
+            }],
+            isError: true
+          }
+        };
+      }
 
       return {
         toolResult: {
@@ -528,13 +556,19 @@ export const unifiedTaxonomyHandlers = {
             type: 'text',
             text: JSON.stringify({
               success: true,
+              verified: true,
               content_id: params.content_id,
               content_type: params.content_type,
-              taxonomy: params.taxonomy,
-              assigned_terms: params.terms,
+              taxonomy: slug,
+              rest_base: restBase,
+              assigned_terms: savedTerms,
               appended: params.append || false,
-              content: response
-            }, null, 2) 
+              content: {
+                id: response.id,
+                link: response.link,
+                [restBase]: savedTerms
+              }
+            }, null, 2)
           }],
           isError: false
         }
@@ -542,9 +576,9 @@ export const unifiedTaxonomyHandlers = {
     } catch (error: any) {
       return {
         toolResult: {
-          content: [{ 
-            type: 'text', 
-            text: `Error assigning terms to content: ${error.message}` 
+          content: [{
+            type: 'text',
+            text: `Error assigning terms to content: ${error.message}`
           }],
           isError: true
         }
@@ -581,6 +615,17 @@ export const unifiedTaxonomyHandlers = {
 
       const terms: any = {};
 
+      // Fetch full term details for a list of term IDs from a taxonomy endpoint
+      const fetchTermDetails = (restBase: string, termIds: number[]) => Promise.all(
+        termIds.map(async (termId: number) => {
+          try {
+            return await makeWordPressRequest('GET', `${restBase}/${termId}`, undefined, { siteId: params.site_id });
+          } catch {
+            return { id: termId, error: 'Could not fetch term details' };
+          }
+        })
+      );
+
       // Plugin endpoints (e.g. EventON `eventonapify/v1`) return their own object
       // shape that embeds taxonomy terms as label arrays instead of wp/v2 term-ID
       // arrays, and some of their taxonomies aren't even REST-registered. Read those
@@ -589,49 +634,27 @@ export const unifiedTaxonomyHandlers = {
 
       if (isPluginObject) {
         Object.assign(terms, extractPluginObjectTerms(content, params.taxonomy));
-      } else {
-        // Standard wp/v2 path: taxonomy fields hold term IDs; resolve each to detail.
-        const taxonomies = await getTaxonomies(false, params.site_id);
+      } else if (params.taxonomy) {
+        // Standard wp/v2 path, specific taxonomy: resolve rest_base, then fetch detail.
+        const { slug, restBase } = await resolveTaxonomy(params.taxonomy, params.site_id);
+        const termIds = content[restBase];
 
-        if (params.taxonomy) {
-          const taxonomyField = params.taxonomy === 'category' ? 'categories' :
-                                params.taxonomy === 'post_tag' ? 'tags' :
-                                params.taxonomy;
-
-          if (content[taxonomyField]) {
-            const endpoint = getTaxonomyEndpoint(params.taxonomy);
-            const termDetails = await Promise.all(
-              content[taxonomyField].map(async (termId: number) => {
-                try {
-                  return await makeWordPressRequest('GET', `${endpoint}/${termId}`, undefined, { siteId: params.site_id });
-                } catch {
-                  return { id: termId, error: 'Could not fetch term details' };
-                }
-              })
-            );
-            terms[params.taxonomy] = termDetails;
-          }
+        if (Array.isArray(termIds) && termIds.length > 0) {
+          terms[slug] = await fetchTermDetails(restBase, termIds);
         } else {
-          for (const [taxonomySlug, taxonomyInfo] of Object.entries(taxonomies)) {
-            const tax = taxonomyInfo as any;
-            if (tax.types && tax.types.includes(params.content_type)) {
-              const taxonomyField = taxonomySlug === 'category' ? 'categories' :
-                                    taxonomySlug === 'post_tag' ? 'tags' :
-                                    taxonomySlug;
+          terms[slug] = [];
+        }
+      } else {
+        // Standard wp/v2 path, all taxonomies registered for this content type.
+        const taxonomies = await getTaxonomies(false, params.site_id);
+        for (const [taxonomySlug, taxonomyInfo] of Object.entries(taxonomies)) {
+          const tax = taxonomyInfo as any;
+          if (tax.types && tax.types.includes(params.content_type)) {
+            const restBase = tax.rest_base || taxonomySlug;
+            const termIds = content[restBase];
 
-              if (content[taxonomyField] && Array.isArray(content[taxonomyField]) && content[taxonomyField].length > 0) {
-                const endpoint = getTaxonomyEndpoint(taxonomySlug);
-                const termDetails = await Promise.all(
-                  content[taxonomyField].map(async (termId: number) => {
-                    try {
-                      return await makeWordPressRequest('GET', `${endpoint}/${termId}`, undefined, { siteId: params.site_id });
-                    } catch {
-                      return { id: termId, error: 'Could not fetch term details' };
-                    }
-                  })
-                );
-                terms[taxonomySlug] = termDetails;
-              }
+            if (Array.isArray(termIds) && termIds.length > 0) {
+              terms[taxonomySlug] = await fetchTermDetails(restBase, termIds);
             }
           }
         }
@@ -639,13 +662,13 @@ export const unifiedTaxonomyHandlers = {
 
       return {
         toolResult: {
-          content: [{ 
-            type: 'text', 
+          content: [{
+            type: 'text',
             text: JSON.stringify({
               content_id: params.content_id,
               content_type: params.content_type,
               terms: terms
-            }, null, 2) 
+            }, null, 2)
           }],
           isError: false
         }
@@ -653,9 +676,9 @@ export const unifiedTaxonomyHandlers = {
     } catch (error: any) {
       return {
         toolResult: {
-          content: [{ 
-            type: 'text', 
-            text: `Error getting content terms: ${error.message}` 
+          content: [{
+            type: 'text',
+            text: `Error getting content terms: ${error.message}`
           }],
           isError: true
         }

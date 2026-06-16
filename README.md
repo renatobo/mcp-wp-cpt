@@ -198,18 +198,20 @@ Manage multiple WordPress sites from a single MCP server:
 
 All content and taxonomy tools support an optional `site_id` parameter to target specific sites.
 
-### **Unified Content Management** (9 tools)
+### **Unified Content Management** (10 tools)
+
 Handles ALL content types (posts, pages, custom post types) with a single set of intelligent tools:
 
-*   `list_content`: List any content type with filtering and pagination
-*   `get_content`: Get specific content by ID and type
-*   `create_content`: Create new content of any type
-*   `update_content`: Update existing content of any type
-*   `delete_content`: Delete content of any type
-*   `discover_content_types`: Find all available content types on your site
-*   `describe_content_type`: Get site-specific contracts and preferred write guidance for a content type
-*   `find_content_by_url`: Smart URL resolver that can find and optionally update content from any WordPress URL
-*   `get_content_by_slug`: Search by slug across all content types
+- `list_content`: List any content type with filtering and pagination
+- `get_content`: Get specific content by ID and type
+- `create_content`: Create new content of any type
+- `update_content`: Update existing content of any type, including targeted partial edits
+- `delete_content`: Delete content of any type
+- `discover_content_types`: Find all available content types on your site
+- `describe_content_type`: Get site-specific contracts and preferred write guidance for a content type
+- `find_content_by_url`: Smart URL resolver that can find and optionally update content from any WordPress URL, including targeted partial edits
+- `get_content_by_slug`: Search by slug across all content types
+- `get_content_summary`: Return a minimal summary (id, title, slug, status, excerpt, taxonomies, word count, Yoast SEO fields) for audit and lookup workflows. Look up by `id` or `url`.
 
 ### **Unified Taxonomy Management** (8 tools)
 Handles ALL taxonomies (categories, tags, custom taxonomies) with a single set of tools:
@@ -262,6 +264,58 @@ The `find_content_by_url` tool can:
 - Optionally update the content in a single operation
 - Works with posts, pages, and any custom post types
 
+#### Audit & Lookup Summaries
+
+The `get_content_summary` tool returns a minimal, fixed-shape representation of a single piece of content. Designed for audit and lookup workflows where the full WP REST response — which can exceed 50KB on recipe posts because of the rendered Recipe Maker card HTML — is overkill.
+
+**Look up by ID** (with optional `content_type`, defaulting to `post`):
+
+```json
+{
+  "id": 4274,
+  "content_type": "post"
+}
+```
+
+**Look up by URL** (content type is detected from the URL):
+
+```json
+{
+  "url": "https://example.com/blog/easy-smoked-asparagus/"
+}
+```
+
+`id` and `url` are mutually exclusive — provide exactly one.
+
+The response shape is fixed:
+
+```json
+{
+  "id": 4274,
+  "title": "Easy Smoked Asparagus & Hot Honey",
+  "slug": "easy-smoked-asparagus",
+  "status": "publish",
+  "link": "https://example.com/blog/easy-smoked-asparagus/",
+  "excerpt": "Smoky asparagus with hot honey.",
+  "date_modified": "2026-04-30T10:14:00",
+  "categories": [12, 7],
+  "tags": [33],
+  "featured_media": 9012,
+  "word_count": 875,
+  "yoast_focus_keyword": "smoked asparagus",
+  "yoast_meta_title": "Easy Smoked Asparagus | Example",
+  "yoast_meta_description": "Smoky charred asparagus finished with chili-lime hot honey."
+}
+```
+
+Field notes:
+
+- `title` and `excerpt` are stripped to plain text (HTML tags removed, basic entities decoded).
+- `word_count` prefers `yoast_head_json.schema.@graph[].wordCount` when Yoast SEO is active; otherwise it is computed from the rendered post content with HTML stripped.
+- `yoast_meta_title` and `yoast_meta_description` are read from `yoast_head_json` on the post. They are `null` when Yoast SEO is not active.
+- `yoast_focus_keyword` is read from `meta._yoast_wpseo_focuskw`. WordPress core only exposes meta keys that are registered with `show_in_rest`, and Yoast SEO does not register this key by default — so this field will typically be `null` unless a companion plugin registers it (see PR #17 for context on the broader meta-key REST exposure issue).
+- This tool internally bypasses the response trimming added in PR #16 so it can read `yoast_head_json`. The trim still applies to all other tools.
+
 #### Universal Content Operations
 All content operations use a single `content_type` parameter:
 ```json
@@ -280,6 +334,56 @@ When a plugin publishes a manifest, `discover_content_types` marks the type with
 - `contract_provider`
 - `preferred_write_mode`
 - `interpreter_ready`
+
+#### Targeted Content Edits
+
+`update_content` and `find_content_by_url.update_fields` can patch the existing raw WordPress content without resending the full document.
+
+To make exact matching easier, `get_content` and `find_content_by_url` both accept `include_raw_content: true`. When enabled, the response is fetched with WordPress edit context and includes a top-level `content_raw` field that matches what `content_edit.target_text` needs.
+
+```json
+{
+  "content_type": "page",
+  "id": 7,
+  "include_raw_content": true
+}
+```
+
+Append a short release note to the end of a post:
+
+```json
+{
+  "content_type": "post",
+  "id": 42,
+  "content_edit": {
+    "operation": "append",
+    "value": "\n<p>Update: Early access is now open.</p>",
+    "content_format": "html"
+  }
+}
+```
+
+Replace a unique HTML fragment or marker comment in place:
+
+```json
+{
+  "content_type": "page",
+  "id": 7,
+  "content_edit": {
+    "operation": "replace",
+    "target_text": "<!-- pricing-card -->\n<p>Old price</p>\n<!-- /pricing-card -->",
+    "value": "<!-- pricing-card -->\n<p>New price</p>\n<!-- /pricing-card -->",
+    "content_format": "html"
+  }
+}
+```
+
+Notes:
+
+- Rendered WordPress HTML can differ from `content.raw` because entities may be escaped and markup may be expanded, so use `include_raw_content` when you need an exact `target_text`.
+- `target_text` matches the stored raw WordPress content exactly.
+- If the same `target_text` appears multiple times, pass `occurrence` to choose the 1-based match.
+- For posts stored as Gutenberg blocks, set `content_edit.convert_to_blocks` when inserting Markdown or HTML that should become blocks.
 
 For contract-backed content types, use `describe_content_type` before writing so the MCP client can inspect the contract, field list, validation rules, execution readiness, and examples returned by the site.
 
@@ -352,6 +456,94 @@ All taxonomy operations use a single `taxonomy` parameter:
 }
 ```
 
+The `taxonomy` parameter accepts either the taxonomy slug or its `rest_base`
+(they can differ for custom taxonomies, e.g. slug `documentation_category`
+with rest_base `documentation-categories`). Tools resolve the identifier via
+`/wp/v2/taxonomies` and error on unknown taxonomies instead of guessing.
+`assign_terms_to_content` verifies the write against the WordPress response
+and reports an error if the terms were not actually saved.
+
+#### Recipe Cards (WP Recipe Maker)
+
+Sites running [WP Recipe Maker](https://wordpress.org/plugins/wp-recipe-maker/) (WPRM) store recipe cards in a separate `wprm_recipe` custom post type referenced by shortcode from the surrounding blog post. The unified content tools handle these recipes directly — no recipe-specific tool family is needed.
+
+**Reading recipes** — `get_content`, `list_content`, `find_content_by_url`, and `get_content_by_slug` all work with `content_type: "wprm_recipe"`. WPRM exposes the full structured recipe payload as a `recipe` field on the REST response, including ingredients, instructions, times, equipment, nutrition, notes, and rating.
+
+**Writing recipes** — pass the recipe payload via `custom_fields.recipe` on `create_content` or `update_content`. WPRM hooks into the WordPress REST insert action (`rest_insert_wprm_recipe`) and reads `recipe` from the request body root, so any field documented by WPRM's data model is accepted.
+
+> The `recipe` payload must be passed via `custom_fields` (which spreads at the request body root). The `meta` parameter nests its values under a `meta` key, which never reaches WPRM's REST hook.
+
+Example update:
+
+```json
+{
+  "content_type": "wprm_recipe",
+  "id": 4274,
+  "custom_fields": {
+    "recipe": {
+      "name": "Easy Smoked Asparagus",
+      "summary": "Smoky asparagus with hot honey.",
+      "servings": "4",
+      "servings_unit": "people",
+      "prep_time": "5",
+      "cook_time": "60",
+      "total_time": "65",
+      "ingredients": [
+        {
+          "name": "",
+          "ingredients": [
+            { "uid": 0, "amount": "1", "unit": "Bunch", "name": "Asparagus Spears", "notes": "" },
+            { "uid": 1, "amount": "1", "unit": "tbsp", "name": "Olive Oil", "notes": "" }
+          ]
+        }
+      ],
+      "instructions": [
+        {
+          "name": "",
+          "instructions": [
+            { "uid": 0, "name": "", "text": "Preheat smoker to 225°F.", "ingredients": [] },
+            { "uid": 1, "name": "", "text": "Drizzle with oil, season, smoke 1 hour.", "ingredients": [] }
+          ]
+        }
+      ],
+      "notes": "Thicker spears need more time."
+    }
+  }
+}
+```
+
+**Grouped ingredients and instructions** — recipes can split items into named groups like "For the sauce" / "For the chicken". Each entry in the outer `ingredients` (or `instructions`) array is one group with its own `name` and inner array:
+
+```json
+{
+  "ingredients": [
+    { "name": "For the sauce",   "ingredients": [ /* items */ ] },
+    { "name": "For the chicken", "ingredients": [ /* items */ ] }
+  ]
+}
+```
+
+Commonly used recipe fields:
+
+| Field           | Type            | Notes                                                |
+| --------------- | --------------- | ---------------------------------------------------- |
+| `name`          | string          | Recipe card title                                    |
+| `summary`       | string          | Short blurb (HTML allowed)                           |
+| `servings`      | string          | e.g. `"4"`                                           |
+| `servings_unit` | string          | e.g. `"people"`, `"servings"`                        |
+| `prep_time`     | string          | minutes, e.g. `"15"`                                 |
+| `cook_time`     | string          | minutes                                              |
+| `total_time`    | string          | minutes                                              |
+| `ingredients`   | array of groups | nested structure shown above                         |
+| `instructions`  | array of groups | nested structure shown above                         |
+| `notes`         | string          | HTML allowed                                         |
+| `equipment`     | array           | items shaped `{ id, name, notes, amount, uid }`      |
+| `image_url`     | string          | upload-by-URL when no `image_id` is supplied         |
+
+Course, cuisine, and keyword are stored as WPRM taxonomies (`wprm_course`, `wprm_cuisine`, `wprm_keyword`). Manage them with the unified taxonomy tools (`list_terms`, `create_term`, …) and link them to a recipe with `assign_terms_to_content`.
+
+WPRM auto-syncs `recipe.summary` back to the WordPress `post_content` field on save. If you want the post body and the recipe summary to differ, pass `content` explicitly alongside `custom_fields.recipe`.
+
 ## Configuration
 
 ### Single Site Configuration
@@ -420,7 +612,46 @@ WORDPRESS_PASSWORD=wp_app_password
 
 # Optional: Custom SQL query endpoint (default: /mcp/v1/query)
 WORDPRESS_SQL_ENDPOINT=/mcp/v1/query
+
+# Optional: Comma-separated list of top-level fields to strip from
+# WordPress REST API responses before they are returned to the MCP
+# client. Defaults to "yoast_head,yoast_head_json" — read-only schema
+# markup that adds ~10KB to every response but is rarely useful to the
+# LLM. Set to an empty string to disable trimming.
+MCP_WP_STRIP_FIELDS=yoast_head,yoast_head_json
 ```
+
+## Response Trimming
+
+By default the server strips the top-level `yoast_head` and `yoast_head_json`
+fields from every WordPress REST API response before returning it to the MCP
+client. These fields contain Yoast SEO's pre-rendered schema markup, which the
+LLM almost never needs but pays tokens for on every request.
+
+- The trim applies to both single-object responses and arrays of objects.
+- Only **top-level** fields are stripped; nested objects are left untouched.
+- Override the list with the `MCP_WP_STRIP_FIELDS` environment variable
+  (comma-separated). Set it to an empty string to disable trimming entirely.
+
+## Meta field limitations
+
+The `meta` parameter on `create_content`, `update_content`, and `find_content_by_url` (with `update_fields.meta`) forwards directly to the WordPress `/wp/v2/{type}/{id}` endpoint. WordPress core **silently drops** any meta key that has not been registered via `register_post_meta(..., ['show_in_rest' => true])`. The MCP server has no allowlist of its own — it relies on WordPress to enforce which keys persist.
+
+This means SEO plugin keys are **not writable through this MCP server by default**, including:
+
+- **Yoast SEO**: `_yoast_wpseo_*` (focuskw, metadesc, title, opengraph-*, twitter-*, canonical, meta-robots-*, primary_category, …)
+- **Rank Math**: `rank_math_*` (title, description, focus_keyword, robots, facebook_*, twitter_*, primary_category, …)
+- **All in One SEO (v4+)**: stores SEO data in a custom table (`wp_aioseo_posts`), not `wp_postmeta` — not addressable via the `meta` field by any means.
+
+The server detects when WordPress dropped any keys you sent and prepends a `Warning:` block to the tool result listing them. This makes the silent drop visible to the LLM caller, but it cannot make WordPress accept the keys.
+
+To enable SEO meta writes, install a small WordPress companion plugin that calls `register_post_meta` for each desired key with `show_in_rest => true` and an appropriate `auth_callback`. A separate `mcp-wp-seo-bridge` plugin is being scoped to do exactly this.
+
+### Which keys DO work today
+
+Plugin keys that the plugin author already registered for REST — for example Genesis layout meta (`_genesis_layout`), WP Recipe Maker fields (`wprm-*`), or ConvertKit's `_wp_convertkit_post_meta`. To check which keys round-trip on your site, write a test value via `update_content` and inspect the `meta` block in the response — if the key appears, it persisted.
+
+The same limitation applies to term meta on `unified-taxonomies` tools (`create_term`, `update_term`).
 
 ## Enabling SQL Query Tool (Optional)
 
@@ -459,6 +690,20 @@ npm run clean
 - `create_content` and `update_content` stay generic on the surface, but switch to contract-driven validation and normalization automatically when an executable contract exists.
 - Rank Math focus keyword sync is detected per site and cached briefly to reduce plugin lookups during repeated writes.
 - If a structured write is attempted without a compatible executable contract, the server returns an explicit compatibility error instead of a generic WordPress failure.
+
+### Running Tests
+
+The repo runs two suites and `npm test` executes both:
+
+- [Vitest](https://vitest.dev/) tests under `tests/` cover the multi-site `SiteManager` and the MCP tool registry wiring.
+- A `node:test` suite under `test/` covers contract manifest caching, payload shaping, and EventON read/write preparation.
+
+```bash
+npm test            # one-shot run (vitest + node:test)
+npm run test:watch  # vitest watch mode
+```
+
+Tests run on `pull_request` and on pushes to `main` via `.github/workflows/test.yml`.
 
 ### Security
 

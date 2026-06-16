@@ -141,11 +141,11 @@ Handles ALL content types (posts, pages, custom post types) with a single set of
 - `list_content` - List any content type with filtering and pagination
 - `get_content` - Get specific content by ID and type
 - `create_content` - Create new content of any type
-- `update_content` - Update existing content of any type
+- `update_content` - Update existing content of any type, including targeted partial edits
 - `delete_content` - Delete content of any type
 - `discover_content_types` - Find all available content types
 - `describe_content_type` - Return contract-backed guidance for a single content type
-- `find_content_by_url` - Smart URL resolver with optional update
+- `find_content_by_url` - Smart URL resolver with optional full or targeted update
 - `get_content_by_slug` - Search by slug across content types
 
 #### **Unified Taxonomy Tools** (`unified-taxonomies.ts`) - 8 tools
@@ -206,6 +206,26 @@ When a content type is contract-backed, `create_content` and `update_content` ca
 
 For EventON APIfy, manifest discovery happens at `eventonapify/v1/mcp-schema`, while write operations still target `wp/v2/ajde_events`.
 
+Targeted content edits are also supported through `content_edit` on `update_content` and `find_content_by_url.update_fields`:
+
+```json
+{
+  "content_type": "post",
+  "id": 42,
+  "content_edit": {
+    "operation": "append",
+    "value": "\n<p>Update: Early access is now open.</p>",
+    "content_format": "html"
+  }
+}
+```
+
+To retrieve an exact target string for those edits, `get_content` and `find_content_by_url` also support `include_raw_content: true`, which fetches the item with WordPress edit context and returns a top-level `content_raw` field.
+
+Rendered WordPress HTML can differ from `content.raw`, so exact partial-edit targeting should use the raw value rather than copied rendered markup.
+
+For targeted operations, `target_text` must match the stored raw WordPress content exactly. If it appears multiple times, provide `occurrence` to choose the 1-based match.
+
 #### Unified Taxonomy Management
 All taxonomy operations use a single `taxonomy` parameter:
 ```json
@@ -216,6 +236,15 @@ All taxonomy operations use a single `taxonomy` parameter:
   "taxonomy": "skill"            // for custom taxonomies
 }
 ```
+
+The `taxonomy` parameter accepts either the taxonomy slug or its `rest_base`
+(custom taxonomies can register a rest_base that differs from the slug, e.g.
+slug `documentation_category` with rest_base `documentation-categories`).
+All taxonomy tools resolve the identifier through a per-site cached
+`/wp/v2/taxonomies` lookup and hard-error on unknown taxonomies — there is no
+slug fallback. `assign_terms_to_content` derives success from the WordPress
+response (the updated content's `rest_base` field must contain the requested
+term IDs) rather than echoing the request.
 
 #### Multi-Site Support
 All tools accept an optional `site_id` parameter to target specific sites:
