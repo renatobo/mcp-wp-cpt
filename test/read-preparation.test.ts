@@ -248,10 +248,49 @@ test('buildListContentRequest falls back to the generic endpoint when list is un
   );
 
   assert.equal(prepared.endpoint, 'event_rsvps');
-  assert.equal(prepared.namespace, undefined);
+  assert.equal(prepared.namespace, 'wp/v2');
   assert.deepEqual(prepared.queryParams, {
     event_id: 14400,
     per_page: 25
+  });
+});
+
+test('buildListContentRequest gives EventON lists start-date semantics with no resolved contract', () => {
+  const prepared = buildListContentRequest(
+    {
+      after: '2025-12-31',
+      before: '2027-01-01',
+      per_page: 100,
+      order: 'asc',
+      orderby: 'date'
+    },
+    {
+      siteId: 'staging',
+      contentType: 'ajde_events',
+      status: 'unresolved',
+      contract: undefined,
+      manifest: undefined,
+      issues: [],
+      executionSupport: { executable: false, issues: [] }
+    } as any
+  );
+
+  assert.equal(prepared.endpoint, 'events');
+  assert.equal(prepared.namespace, 'eventonapify/v1');
+  assert.deepEqual(prepared.fallbackOn404, {
+    endpoint: 'ajde_events',
+    namespace: 'wp/v2'
+  });
+  assert.deepEqual(prepared.queryParams, {
+    starts_on_or_after: '2025-12-31',
+    starts_before: '2027-01-01',
+    per_page: 100,
+    order: 'asc'
+  });
+  assert.deepEqual(prepared.responseFilter, {
+    eventStartAfter: '2025-12-31',
+    eventStartBefore: '2027-01-01',
+    eventStartOrder: 'asc'
   });
 });
 
