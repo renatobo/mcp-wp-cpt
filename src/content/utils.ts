@@ -7,6 +7,53 @@ export function getContentEndpoint(contentType: string): string {
   return endpointMap[contentType] || contentType;
 }
 
+// Normalizes list responses into an array of items. Standard wp/v2 collections
+// are arrays, while plugin endpoints (e.g. EventON `eventonapify/v1/events`)
+// wrap their results in a keyed envelope such as `{ events: [...] }`.
+export function extractContentCollection(response: unknown): any[] {
+  if (Array.isArray(response)) {
+    return response;
+  }
+
+  if (response && typeof response === 'object') {
+    const payload = response as Record<string, unknown>;
+    for (const key of ['events', 'items', 'data', 'results']) {
+      if (Array.isArray(payload[key])) {
+        return payload[key] as any[];
+      }
+    }
+  }
+
+  return [];
+}
+
+// Matches a content item by slug across the shapes different endpoints use.
+export function findItemBySlug(items: any[], slug: string): any | undefined {
+  return items.find((item) => {
+    if (!item || typeof item !== 'object') {
+      return false;
+    }
+
+    if (item.slug === slug || item.post_name === slug) {
+      return true;
+    }
+
+    const link =
+      typeof item.link === 'string'
+        ? item.link
+        : typeof item.permalink === 'string'
+          ? item.permalink
+          : undefined;
+
+    if (link) {
+      const parts = link.replace(/\/+$/, '').split('/').filter(Boolean);
+      return parts[parts.length - 1] === slug;
+    }
+
+    return false;
+  });
+}
+
 export function removeUndefinedValues<T extends Record<string, unknown>>(value: T): T {
   for (const key of Object.keys(value)) {
     if (value[key] === undefined) {

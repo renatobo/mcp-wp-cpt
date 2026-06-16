@@ -16,7 +16,7 @@ import {
   prepareContentDeleteRequest,
   prepareContentWriteRequest
 } from '../content/write-preparation.js';
-import { getContentEndpoint } from '../content/utils.js';
+import { getContentEndpoint, extractContentCollection, findItemBySlug } from '../content/utils.js';
 import { prepareGetContentRequest, prepareListContentRequest } from '../content/read-preparation.js';
 import { ContractCompatibilityError, ContractValidationError } from '../adapters/types.js';
 
@@ -155,32 +155,88 @@ function parseUrl(url: string): { slug: string; pathHints: string[] } {
   }
 }
 
+// Derives a full-text search term from a slug (e.g. "official-clubs-week-2026"
+// -> "official clubs week 2026") for endpoints that honor `search` but not `slug`.
+function slugToSearchTerm(slug: string): string {
+  return slug.replace(/[-_]+/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
 // Helper function to find content across multiple post types
 async function findContentAcrossTypes(slug: string, contentTypes?: string[], siteId?: string) {
   const typesToSearch = contentTypes || [];
-  
+
   // If no specific content types provided, get all available types
   if (typesToSearch.length === 0) {
     const allTypes = await getPostTypes(false, siteId);
-    typesToSearch.push(...Object.keys(allTypes).filter(type => 
-      type !== 'attachment' && type !== 'wp_block'
-    ));
+    const typeSet = new Set<string>(
+      Object.keys(allTypes).filter(type => type !== 'attachment' && type !== 'wp_block')
+    );
+
+    // Include contract-backed types that aren't exposed in the standard REST API
+    // (e.g. EventON `ajde_events` registered with show_in_rest=false), so they are
+    // resolvable by slug/URL just like list_content can enumerate them.
+    try {
+      const resolvedContracts = await listResolvedContentTypeContracts(siteId, false);
+      for (const { contract } of resolvedContracts) {
+        // Nested contracts (e.g. event_rsvps) require parent context and can't be resolved by slug alone.
+        if (contract.parent_context) {
+          continue;
+        }
+        typeSet.add(contract.slug);
+      }
+    } catch (error) {
+      logToFile(`Could not load contract-backed types for slug search: ${error}`, 'debug');
+    }
+
+    typesToSearch.push(...typeSet);
   }
-  
+
   logToFile(`Searching for slug "${slug}" across content types: ${typesToSearch.join(', ')}`, 'debug');
 
   const searchOne = async (contentType: string) => {
     try {
-      const endpoint = getContentEndpoint(contentType);
+      // Use the same contract-aware routing list_content relies on, so content
+      // types that aren't REST-exposed still resolve via their plugin endpoint.
+      const preparedRequest = await prepareListContentRequest({
+        contentType,
+        siteId,
+        input: { slug, per_page: 100 }
+      });
 
-      const response = await makeWordPressRequest('GET', endpoint, {
-        slug,
-        per_page: 1
-      }, { siteId });
+      const response = await makeWordPressRequest('GET', preparedRequest.endpoint, preparedRequest.queryParams, {
+        siteId,
+        namespace: preparedRequest.namespace,
+        retry404With: preparedRequest.fallbackOn404
+      });
 
-      if (Array.isArray(response) && response.length > 0) {
+      const items = extractContentCollection(response);
+      // For wp/v2 array responses the `slug` filter is honored server-side, so the
+      // result is authoritative: match by slug, or accept a lone server-filtered row.
+      let match = findItemBySlug(items, slug) || (Array.isArray(response) && items.length === 1 ? items[0] : undefined);
+
+      // Plugin endpoints return an enveloped response (e.g. EventON `{ events: [...] }`)
+      // and ignore the `slug` query param entirely, so the first attempt above can't
+      // confirm a match. Retry with a search term derived from the slug (which these
+      // endpoints do honor) and match the exact slug client-side.
+      if (!match && !Array.isArray(response)) {
+        const searchRequest = await prepareListContentRequest({
+          contentType,
+          siteId,
+          input: { search: slugToSearchTerm(slug), per_page: 100 }
+        });
+
+        const searchResponse = await makeWordPressRequest('GET', searchRequest.endpoint, searchRequest.queryParams, {
+          siteId,
+          namespace: searchRequest.namespace,
+          retry404With: searchRequest.fallbackOn404
+        });
+
+        match = findItemBySlug(extractContentCollection(searchResponse), slug);
+      }
+
+      if (match) {
         logToFile(`Found content with slug "${slug}" in content type "${contentType}"`, 'info');
-        return { content: response[0], contentType };
+        return { content: match, contentType };
       }
     } catch (error) {
       logToFile(`Error searching ${contentType}: ${error}`, 'debug');
@@ -1064,7 +1120,8 @@ export const unifiedContentHandlers = {
         'services': ['service'],
         'testimonials': ['testimonial'],
         'team': ['team_member', 'staff'],
-        'events': ['event'],
+        'events': ['ajde_events', 'event'],
+        'event': ['ajde_events', 'event'],
         'courses': ['course', 'lesson']
       };
       

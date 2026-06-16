@@ -5,7 +5,34 @@ import {
   buildGetContentRequest,
   buildListContentRequest
 } from '../src/content/read-preparation.js';
-import { splitNamespacedEndpoint } from '../src/content/utils.js';
+import {
+  extractContentCollection,
+  findItemBySlug,
+  splitNamespacedEndpoint
+} from '../src/content/utils.js';
+
+test('extractContentCollection normalizes array and enveloped list responses', () => {
+  assert.deepEqual(extractContentCollection([{ id: 1 }]), [{ id: 1 }]);
+  assert.deepEqual(
+    extractContentCollection({ events: [{ id: 2 }], total: 1 }),
+    [{ id: 2 }]
+  );
+  assert.deepEqual(extractContentCollection({ items: [{ id: 3 }] }), [{ id: 3 }]);
+  assert.deepEqual(extractContentCollection({ nothing: true }), []);
+  assert.deepEqual(extractContentCollection(null), []);
+});
+
+test('findItemBySlug matches slug, post_name, and trailing link segment', () => {
+  const items = [
+    { id: 1, slug: 'other-event' },
+    { id: 2, post_name: 'gala-night' },
+    { id: 3, link: 'https://site.com/events/california-clubs-week-2026/' }
+  ];
+
+  assert.equal(findItemBySlug(items, 'gala-night')?.id, 2);
+  assert.equal(findItemBySlug(items, 'california-clubs-week-2026')?.id, 3);
+  assert.equal(findItemBySlug(items, 'missing'), undefined);
+});
 
 test('splitNamespacedEndpoint parses custom plugin namespaces', () => {
   const result = splitNamespacedEndpoint(

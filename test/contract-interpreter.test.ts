@@ -85,6 +85,7 @@ test('contract interpreter validates and normalizes structured create input', ()
   const prepared = prepareContractWriteRequest(
     {
       title: 'Launch Party',
+      slug: 'custom-launch-party',
       status: 'draft',
       custom_fields: {
         legacy_flag: true
@@ -117,6 +118,7 @@ test('contract interpreter validates and normalizes structured create input', ()
     namespace: 'eventonapify/v1'
   });
   assert.equal(prepared.data.title, 'Launch Party');
+  assert.equal(prepared.data.slug, 'custom-launch-party');
   assert.equal(prepared.data.status, 'draft');
   assert.equal(prepared.data.legacy_flag, true);
   assert.deepEqual(prepared.data.organizers, [{ name: 'Renato' }]);
@@ -128,6 +130,7 @@ test('contract update requests append the content ID to primary and fallback end
   const prepared = prepareContractWriteRequest(
     {
       title: 'Updated Launch Party',
+      slug: 'updated-launch-party',
       fields: {
         end_date: '2026-04-01',
         end_time: '21:00'
@@ -146,6 +149,7 @@ test('contract update requests append the content ID to primary and fallback end
 
   assert.equal(itemRequest.endpoint, 'ajde_events/123');
   assert.equal(itemRequest.namespace, 'wp/v2');
+  assert.equal(itemRequest.data.slug, 'updated-launch-party');
   assert.deepEqual(itemRequest.fallbackOn404, {
     endpoint: 'events/123',
     namespace: 'eventonapify/v1'
