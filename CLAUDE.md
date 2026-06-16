@@ -26,6 +26,8 @@ npm start
 npm run clean
 ```
 
+`src/cli.ts` is the npx entry point (the published `@instawp/mcp-wp` bin): it validates env vars then spawns `build/server.js`.
+
 ### Environment Setup
 
 #### Single Site Configuration
@@ -88,7 +90,12 @@ The app password can be generated from WordPress admin panel following the [Appl
    - `interpreter.ts` validates and normalizes structured fields from manifest rules
    - Contracts are discovery-only; actual content writes still use the relevant `wp/v2` endpoint
 
-5. **Tool System (`src/tools/`)**: 
+5. **Content Routing (`src/content/`)**:
+   - `read-preparation.ts` / `write-preparation.ts` turn tool params into the resolved endpoint, namespace, query params, and any post-fetch response filter
+   - `utils.ts` holds endpoint resolution (`getPreferredReadEndpoint`, `getDefensiveEndpointFallback`) and response normalization
+   - `payloads.ts` shapes create/update bodies
+
+6. **Tool System (`src/tools/`)**: 
    - Each WordPress entity (posts, pages, media, etc.) has its own module
    - Each module exports tools array and handlers object
    - Tools use Zod schemas for input validation and type safety
@@ -270,3 +277,9 @@ The server integrates with Claude Desktop via the configuration in `claude_deskt
 
 - `npm test` runs the lightweight `node:test` suite through `tsx`
 - Coverage currently focuses on manifest caching, generic payload shaping, and contract-driven EventON validation/normalization
+
+## Gotchas
+
+- **This is a fork.** `origin` is `renatobo/mcp-wp-cpt`; `upstream` is `InstaWP/mcp-wp`. `gh pr create` defaults the base to upstream and fails. Always pass `--repo renatobo/mcp-wp-cpt`.
+- **EventON reads route to `eventonapify/v1/events`** (not `wp/v2/ajde_events`), with a 404 fallback to `wp/v2`. Routing is keyed on `content_type === 'ajde_events'` alone, so it also works when the contract fails to resolve.
+- **`after`/`before` on EventON event lists mean event start date, not publish date.** They are remapped to `starts_on_or_after`/`starts_before` server-side, plus a client-side start-date filter. On the plain `wp/v2/ajde_events` path these would filter the WordPress publish date instead.
