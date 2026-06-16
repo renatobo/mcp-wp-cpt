@@ -153,6 +153,7 @@ test('buildContractListRequest prefers the EventON read endpoint for ajde_events
   });
   assert.deepEqual(prepared.queryParams, {
     starts_on_or_after: '2025-12-31',
+    starts_before: '2027-01-01',
     per_page: 100,
     order: 'asc'
   });
@@ -275,6 +276,7 @@ test('buildListContentRequest still uses direct EventON reads when list support 
   assert.equal(prepared.namespace, 'eventonapify/v1');
   assert.deepEqual(prepared.queryParams, {
     starts_on_or_after: '2025-12-31',
+    starts_before: '2027-01-01',
     per_page: 100,
     order: 'asc'
   });

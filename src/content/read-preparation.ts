@@ -264,6 +264,7 @@ function normalizeContractListQueryParamsForRead(
   }
 
   if (before) {
+    queryParams.starts_before = before;
     responseFilter.eventStartBefore = before;
   }
 
