@@ -556,6 +556,37 @@ async function resolveWriteInput(params: UpdateContentParams): Promise<UpdateCon
 // route writes through the contract layer, content_edit resolution, and Rank Math
 // focus-keyword sync. Returns the raw WP response plus any non-fatal warnings; each
 // caller formats its own envelope.
+// Best-effort Rank Math focus-keyword sync. Returns any non-fatal warning to
+// surface to the caller; never throws and no-ops when there's nothing to sync.
+async function syncRankMathFocusKeywordWithWarnings(
+  focusKeyword: string | undefined,
+  contentId: number,
+  siteId?: string
+): Promise<string[]> {
+  if (!focusKeyword) {
+    return [];
+  }
+  if (!(await isRankMathActive(false, siteId))) {
+    logToFile('Rank Math plugin is not active; skipping focus keyword sync.');
+    return [];
+  }
+  try {
+    await syncRankMathFocusKeyword(contentId, focusKeyword, siteId);
+    return [];
+  } catch (error: any) {
+    const message = `Rank Math focus keyword sync failed: ${error.message}`;
+    logToFile(message);
+    return [message];
+  }
+}
+
+// Attach collected warnings to an object WP response under _mcp_warnings.
+function attachWarnings(response: any, warnings: string[]): any {
+  return warnings.length > 0 && response && typeof response === 'object' && !Array.isArray(response)
+    ? { ...(response as Record<string, unknown>), _mcp_warnings: warnings }
+    : response;
+}
+
 async function executeContentUpdate(params: UpdateContentParams): Promise<{ response: any; warnings: string[] }> {
   const input = await resolveWriteInput(params);
   const preparedRequest = await prepareContentWriteRequest({
@@ -572,22 +603,8 @@ async function executeContentUpdate(params: UpdateContentParams): Promise<{ resp
     retry404With: itemRequest.fallbackOn404
   });
 
-  const warnings: string[] = [];
   const focusKeyword = readFocusKeywordForRankMathSync(preparedRequest.data, input);
-  if (focusKeyword) {
-    const rankMathActive = await isRankMathActive(false, params.site_id);
-    if (rankMathActive) {
-      try {
-        await syncRankMathFocusKeyword(params.id, focusKeyword, params.site_id);
-      } catch (error: any) {
-        const message = `Rank Math focus keyword sync failed: ${error.message}`;
-        warnings.push(message);
-        logToFile(message);
-      }
-    } else {
-      logToFile('Rank Math plugin is not active; skipping focus keyword sync.');
-    }
-  }
+  const warnings = await syncRankMathFocusKeywordWithWarnings(focusKeyword, params.id, params.site_id);
 
   return { response, warnings };
 }
@@ -1183,31 +1200,18 @@ export const unifiedContentHandlers = {
         retry404With: preparedRequest.fallbackOn404
       });
 
-      const warnings: string[] = [];
+      // Only sync when the create response carries a numeric id to target.
+      const newId = response && typeof response === 'object' && typeof (response as any).id === 'number'
+        ? (response as any).id
+        : undefined;
       const focusKeyword = readFocusKeywordForRankMathSync(preparedRequest.data, input);
-      if (focusKeyword && response && typeof response === 'object' && typeof (response as any).id === 'number') {
-        const rankMathActive = await isRankMathActive(false, params.site_id);
-        if (rankMathActive) {
-          try {
-            await syncRankMathFocusKeyword((response as any).id, focusKeyword, params.site_id);
-          } catch (error: any) {
-            const message = `Rank Math focus keyword sync failed: ${error.message}`;
-            warnings.push(message);
-            logToFile(message);
-          }
-        } else {
-          logToFile('Rank Math plugin is not active; skipping focus keyword sync.');
-        }
-      }
-
-      const responseWithWarnings =
-        warnings.length > 0 && response && typeof response === 'object' && !Array.isArray(response)
-          ? { ...(response as Record<string, unknown>), _mcp_warnings: warnings }
-          : response;
+      const warnings = newId !== undefined
+        ? await syncRankMathFocusKeywordWithWarnings(focusKeyword, newId, params.site_id)
+        : [];
 
       const responseContent: any[] = [{
         type: 'text',
-        text: JSON.stringify(responseWithWarnings, null, 2)
+        text: JSON.stringify(attachWarnings(response, warnings), null, 2)
       }];
       const droppedMeta = detectDroppedMetaKeys(params.meta, response);
       if (droppedMeta.length > 0) {
@@ -1241,14 +1245,9 @@ export const unifiedContentHandlers = {
     try {
       const { response, warnings } = await executeContentUpdate(params);
 
-      const responseWithWarnings =
-        warnings.length > 0 && response && typeof response === 'object' && !Array.isArray(response)
-          ? { ...(response as Record<string, unknown>), _mcp_warnings: warnings }
-          : response;
-
       const responseContent: any[] = [{
         type: 'text',
-        text: JSON.stringify(responseWithWarnings, null, 2)
+        text: JSON.stringify(attachWarnings(response, warnings), null, 2)
       }];
       const droppedMeta = detectDroppedMetaKeys(params.meta, response);
       if (droppedMeta.length > 0) {
@@ -1473,13 +1472,11 @@ export const unifiedContentHandlers = {
           ...params.update_fields
         } as UpdateContentParams);
 
-        // Re-read through the contract-aware route so the returned content reflects
-        // the saved state and can include content_raw when requested.
-        const refetched = await fetchContentForType(contentType, content.id, params.site_id, params.include_raw_content || false);
-        const displayContent =
-          warnings.length > 0 && refetched && typeof refetched === 'object' && !Array.isArray(refetched)
-            ? { ...(refetched as Record<string, unknown>), _mcp_warnings: warnings }
-            : refetched;
+        // The write response already echoes the saved state (like update_content);
+        // only re-read when include_raw_content needs the context=edit content_raw.
+        const saved = params.include_raw_content
+          ? await fetchContentForType(contentType, content.id, params.site_id, true)
+          : response;
 
         const responseContent: any[] = [{
           type: 'text',
@@ -1489,8 +1486,8 @@ export const unifiedContentHandlers = {
             content_id: content.id,
             original_url: params.url,
             updated: true,
-            content: displayContent,
-            content_raw: params.include_raw_content ? (refetched as any).content_raw : undefined
+            content: attachWarnings(saved, warnings),
+            content_raw: params.include_raw_content ? (saved as any).content_raw : undefined
           }, null, 2)
         }];
         const droppedMeta = detectDroppedMetaKeys(params.update_fields.meta, response);
