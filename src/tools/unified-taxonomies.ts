@@ -70,6 +70,66 @@ export function isEmbeddedTermField(key: string, value: unknown): boolean {
   return value.every((entry) => entry && typeof entry === 'object' && 'term_id' in (entry as object));
 }
 
+// Maps a plugin object field key to its base taxonomy slug. Identifier-bearing
+// companion fields (e.g. event_type_terms, tag_terms) collapse onto the base
+// taxonomy so they don't surface as duplicate taxonomies.
+function fieldToTaxonomyBase(key: string): string {
+  const stripped = key.endsWith('_terms') ? key.slice(0, -'_terms'.length) : key;
+  return stripped === 'tag' || stripped === 'tags' ? 'post_tag' : stripped;
+}
+
+// Candidate field names a plugin object may use for a given taxonomy: a label-only
+// array and an identifier-bearing companion array.
+function embeddedFieldNames(taxonomyBase: string): { label: string; enriched: string } {
+  if (taxonomyBase === 'post_tag') {
+    return { label: 'tags', enriched: 'tag_terms' };
+  }
+  return { label: taxonomyBase, enriched: `${taxonomyBase}_terms` };
+}
+
+// Extracts taxonomy terms embedded directly in a plugin content object, preferring
+// identifier-bearing `*_terms` arrays over label-only arrays for the same taxonomy.
+export function extractPluginObjectTerms(content: any, taxonomy?: string): Record<string, any[]> {
+  const terms: Record<string, any[]> = {};
+
+  if (!content || typeof content !== 'object') {
+    return terms;
+  }
+
+  if (taxonomy) {
+    const { label, enriched } = embeddedFieldNames(taxonomy);
+    const value = isEmbeddedTermField(enriched, content[enriched])
+      ? content[enriched]
+      : isEmbeddedTermField(label, content[label])
+        ? content[label]
+        : undefined;
+    const normalized = value ? normalizeEmbeddedTerms(value) : [];
+    if (normalized.length > 0) {
+      terms[taxonomy] = normalized;
+    }
+    return terms;
+  }
+
+  const chosen = new Map<string, { value: unknown; enriched: boolean }>();
+  for (const [key, value] of Object.entries(content)) {
+    if (!isEmbeddedTermField(key, value)) {
+      continue;
+    }
+    const enriched = key.endsWith('_terms');
+    const base = fieldToTaxonomyBase(key);
+    const existing = chosen.get(base);
+    if (!existing || (enriched && !existing.enriched)) {
+      chosen.set(base, { value, enriched });
+    }
+  }
+
+  for (const [base, { value }] of chosen) {
+    terms[base] = normalizeEmbeddedTerms(value);
+  }
+
+  return terms;
+}
+
 // Helper function to get the correct endpoint for a taxonomy
 function getTaxonomyEndpoint(taxonomy: string): string {
   const endpointMap: Record<string, string> = {
@@ -528,20 +588,7 @@ export const unifiedTaxonomyHandlers = {
       const isPluginObject = Boolean(preparedRequest.namespace && preparedRequest.namespace !== 'wp/v2');
 
       if (isPluginObject) {
-        if (params.taxonomy) {
-          const field = params.taxonomy === 'post_tag' ? 'tags' : params.taxonomy;
-          const embedded = normalizeEmbeddedTerms(content?.[field]);
-          if (embedded.length > 0) {
-            terms[params.taxonomy] = embedded;
-          }
-        } else {
-          for (const [key, value] of Object.entries(content || {})) {
-            if (isEmbeddedTermField(key, value)) {
-              const taxonomySlug = key === 'tags' ? 'post_tag' : key;
-              terms[taxonomySlug] = normalizeEmbeddedTerms(value);
-            }
-          }
-        }
+        Object.assign(terms, extractPluginObjectTerms(content, params.taxonomy));
       } else {
         // Standard wp/v2 path: taxonomy fields hold term IDs; resolve each to detail.
         const taxonomies = await getTaxonomies(false, params.site_id);
