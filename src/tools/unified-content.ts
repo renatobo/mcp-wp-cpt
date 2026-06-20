@@ -353,26 +353,6 @@ type ContentEditParams = {
   content_format?: ContentFormat;
   convert_to_blocks?: boolean;
 };
-type ContentUpdateInput = {
-  title?: string;
-  content?: string;
-  content_format?: ContentFormat;
-  convert_to_blocks?: boolean;
-  content_edit?: ContentEditParams;
-  status?: string;
-  excerpt?: string;
-  slug?: string;
-  author?: number;
-  parent?: number;
-  categories?: number[];
-  tags?: number[];
-  featured_media?: number;
-  format?: string;
-  menu_order?: number;
-  meta?: Record<string, any>;
-  custom_fields?: Record<string, any>;
-};
-
 function detectContentFormat(content: string): DetectedFormat {
   if (/<!--\s*wp:/.test(content)) {
     return 'blocks';
@@ -541,6 +521,121 @@ async function processWriteContent<T extends { content?: string; content_format?
   };
 }
 
+// Resolve an update's body before the contract pipeline runs. When content_edit
+// is supplied, fetch the existing raw content (contract-aware), apply the targeted
+// edit, and hand the finished body to the pipeline so partial edits work uniformly
+// across content types — including contract-backed ones. Otherwise fall back to the
+// generic content processing used for full-document writes.
+async function resolveWriteInput(params: UpdateContentParams): Promise<UpdateContentParams> {
+  if (params.content_edit === undefined) {
+    return processWriteContent(params);
+  }
+
+  if (params.content !== undefined) {
+    throw new Error('Provide either content or content_edit, not both');
+  }
+
+  const edit = params.content_edit as ContentEditParams;
+  validateContentEdit(edit);
+
+  const existingRaw = await fetchEditableRawContentForType(params.content_type, params.id, params.site_id);
+  const processedFragment = await processContent(
+    edit.value,
+    edit.content_format || 'auto',
+    edit.convert_to_blocks || false
+  );
+  const mergedContent = applyContentEdit(existingRaw, { ...edit, value: processedFragment });
+
+  // The merged body is already in final WordPress form; strip the edit and format
+  // hints so the contract pipeline forwards it verbatim instead of reprocessing.
+  const { content_edit, content_format, convert_to_blocks, ...rest } = params as any;
+  return { ...rest, content: mergedContent } as UpdateContentParams;
+}
+
+// Shared update pipeline used by update_content and find_content_by_url so both
+// route writes through the contract layer, content_edit resolution, and Rank Math
+// focus-keyword sync. Returns the raw WP response plus any non-fatal warnings; each
+// caller formats its own envelope.
+// Best-effort Rank Math focus-keyword sync. Returns any non-fatal warning to
+// surface to the caller; never throws and no-ops when there's nothing to sync.
+async function syncRankMathFocusKeywordWithWarnings(
+  focusKeyword: string | undefined,
+  contentId: number,
+  siteId?: string
+): Promise<string[]> {
+  if (!focusKeyword) {
+    return [];
+  }
+  if (!(await isRankMathActive(false, siteId))) {
+    logToFile('Rank Math plugin is not active; skipping focus keyword sync.');
+    return [];
+  }
+  try {
+    await syncRankMathFocusKeyword(contentId, focusKeyword, siteId);
+    return [];
+  } catch (error: any) {
+    const message = `Rank Math focus keyword sync failed: ${error.message}`;
+    logToFile(message);
+    return [message];
+  }
+}
+
+// Attach collected warnings to an object WP response under _mcp_warnings.
+function attachWarnings(response: any, warnings: string[]): any {
+  return warnings.length > 0 && response && typeof response === 'object' && !Array.isArray(response)
+    ? { ...(response as Record<string, unknown>), _mcp_warnings: warnings }
+    : response;
+}
+
+async function executeContentUpdate(params: UpdateContentParams): Promise<{ response: any; warnings: string[] }> {
+  const input = await resolveWriteInput(params);
+  const preparedRequest = await prepareContentWriteRequest({
+    operation: 'update',
+    contentType: input.content_type,
+    siteId: input.site_id,
+    input
+  });
+  const itemRequest = attachContentIdToPreparedRequest(preparedRequest, params.id);
+
+  const response = await makeWordPressRequest('POST', itemRequest.endpoint, itemRequest.data, {
+    siteId: params.site_id,
+    namespace: itemRequest.namespace,
+    retry404With: itemRequest.fallbackOn404
+  });
+
+  const focusKeyword = readFocusKeywordForRankMathSync(preparedRequest.data, input);
+  const warnings = await syncRankMathFocusKeywordWithWarnings(focusKeyword, params.id, params.site_id);
+
+  return { response, warnings };
+}
+
+// Contract-aware read used by get_content and find_content_by_url, optionally
+// surfacing a top-level content_raw alias for exact partial-edit targeting.
+async function fetchContentForType(
+  contentType: string,
+  id: number,
+  siteId?: string,
+  includeRawContent: boolean = false
+) {
+  const preparedRequest = await prepareGetContentRequest({ contentType, siteId });
+  const fallbackOn404 = preparedRequest.fallbackOn404
+    ? {
+        endpoint: `${preparedRequest.fallbackOn404.endpoint}/${id}`,
+        namespace: preparedRequest.fallbackOn404.namespace
+      }
+    : undefined;
+  const response = await makeWordPressRequest(
+    'GET',
+    `${preparedRequest.endpoint}/${id}`,
+    includeRawContent ? { context: 'edit' } : undefined,
+    { siteId, namespace: preparedRequest.namespace, retry404With: fallbackOn404 }
+  );
+
+  return includeRawContent && response && typeof response === 'object'
+    ? withContentRawAlias(response as Record<string, any>)
+    : response;
+}
+
 // Return the meta keys that were sent in the request but don't appear in
 // the WP response's `meta` object. WordPress silently drops unregistered
 // meta keys on writes to /wp/v2/{type}/{id}, so absence in the echoed
@@ -624,7 +719,7 @@ function getTargetMatchIndex(content: string, targetText: string, occurrence?: n
   return resolvedIndex;
 }
 
-function applyContentEdit(existingContent: string, edit: ContentEditParams): string {
+export function applyContentEdit(existingContent: string, edit: ContentEditParams): string {
   validateContentEdit(edit);
 
   switch (edit.operation) {
@@ -650,10 +745,13 @@ function applyContentEdit(existingContent: string, edit: ContentEditParams): str
   }
 }
 
-async function getEditableRawContent(endpoint: string, id: number, siteId?: string): Promise<string> {
-  const response = await fetchContentById(endpoint, id, siteId, true);
+// Reads the raw content body via the contract-aware route (and 404 fallback) the
+// same way get_content does, so partial edits and raw reads work for content types
+// that aren't on wp/v2 (e.g. EventON ajde_events).
+async function fetchEditableRawContentForType(contentType: string, id: number, siteId?: string): Promise<string> {
+  const response = await fetchContentForType(contentType, id, siteId, true);
 
-  const rawContent = response?.content?.raw;
+  const rawContent = (response as any)?.content?.raw;
   if (typeof rawContent !== 'string') {
     throw new Error('Partial content edits require WordPress edit access and a REST response that includes content.raw');
   }
@@ -671,91 +769,6 @@ function withContentRawAlias<T extends Record<string, any>>(response: T): T & { 
     ...response,
     content_raw: rawContent
   };
-}
-
-async function fetchContentById(
-  endpoint: string,
-  id: number,
-  siteId?: string,
-  includeRawContent: boolean = false
-) {
-  const response = await makeWordPressRequest(
-    'GET',
-    `${endpoint}/${id}`,
-    includeRawContent ? { context: 'edit' } : undefined,
-    { siteId }
-  );
-
-  return includeRawContent ? withContentRawAlias(response) : response;
-}
-
-async function resolveUpdatedContent(
-  input: ContentUpdateInput,
-  endpoint: string,
-  id: number,
-  siteId?: string
-): Promise<string | undefined> {
-  if (input.content !== undefined && input.content_edit !== undefined) {
-    throw new Error('Provide either content or content_edit, not both');
-  }
-
-  if (input.content !== undefined) {
-    return processContent(
-      input.content,
-      input.content_format || 'auto',
-      input.convert_to_blocks || false
-    );
-  }
-
-  if (input.content_edit !== undefined) {
-    validateContentEdit(input.content_edit);
-
-    const existingContent = await getEditableRawContent(endpoint, id, siteId);
-    const processedFragment = await processContent(
-      input.content_edit.value,
-      input.content_edit.content_format || 'auto',
-      input.content_edit.convert_to_blocks || false
-    );
-
-    return applyContentEdit(existingContent, {
-      ...input.content_edit,
-      value: processedFragment
-    });
-  }
-
-  return undefined;
-}
-
-async function buildContentUpdateData(
-  input: ContentUpdateInput,
-  endpoint: string,
-  id: number,
-  siteId?: string
-) {
-  const updateData: any = {};
-
-  if (input.title !== undefined) updateData.title = input.title;
-
-  const updatedContent = await resolveUpdatedContent(input, endpoint, id, siteId);
-  if (updatedContent !== undefined) updateData.content = updatedContent;
-
-  if (input.status !== undefined) updateData.status = input.status;
-  if (input.excerpt !== undefined) updateData.excerpt = input.excerpt;
-  if (input.slug !== undefined) updateData.slug = input.slug;
-  if (input.author !== undefined) updateData.author = input.author;
-  if (input.parent !== undefined) updateData.parent = input.parent;
-  if (input.featured_media !== undefined) updateData.featured_media = input.featured_media;
-  if (input.format !== undefined) updateData.format = input.format;
-  if (input.menu_order !== undefined) updateData.menu_order = input.menu_order;
-  if (input.categories !== undefined) updateData.categories = input.categories;
-  if (input.tags !== undefined) updateData.tags = input.tags;
-  if (input.meta !== undefined) updateData.meta = input.meta;
-
-  if (input.custom_fields) {
-    Object.assign(updateData, input.custom_fields);
-  }
-
-  return updateData;
 }
 
 // Schema definitions
@@ -1142,22 +1155,19 @@ export const unifiedContentHandlers = {
 
   get_content: async (params: GetContentParams) => {
     try {
-      const preparedRequest = await prepareGetContentRequest({
-        contentType: params.content_type,
-        siteId: params.site_id
-      });
-      const response = await makeWordPressRequest('GET', `${preparedRequest.endpoint}/${params.id}`, undefined, {
-        siteId: params.site_id,
-        namespace: preparedRequest.namespace,
-        retry404With: preparedRequest.fallbackOn404
-      });
-
+      // Contract-aware read; include_raw_content adds a top-level content_raw alias.
+      const response = await fetchContentForType(
+        params.content_type,
+        params.id,
+        params.site_id,
+        params.include_raw_content || false
+      );
 
       return {
         toolResult: {
-          content: [{ 
-            type: 'text', 
-            text: JSON.stringify(response, null, 2) 
+          content: [{
+            type: 'text',
+            text: JSON.stringify(response, null, 2)
           }],
           isError: false
         }
@@ -1165,9 +1175,9 @@ export const unifiedContentHandlers = {
     } catch (error: any) {
       return {
         toolResult: {
-          content: [{ 
-            type: 'text', 
-            text: `Error getting content: ${error.message}` 
+          content: [{
+            type: 'text',
+            text: `Error getting content: ${error.message}`
           }],
           isError: true
         }
@@ -1190,31 +1200,18 @@ export const unifiedContentHandlers = {
         retry404With: preparedRequest.fallbackOn404
       });
 
-      const warnings: string[] = [];
+      // Only sync when the create response carries a numeric id to target.
+      const newId = response && typeof response === 'object' && typeof (response as any).id === 'number'
+        ? (response as any).id
+        : undefined;
       const focusKeyword = readFocusKeywordForRankMathSync(preparedRequest.data, input);
-      if (focusKeyword && response && typeof response === 'object' && typeof (response as any).id === 'number') {
-        const rankMathActive = await isRankMathActive(false, params.site_id);
-        if (rankMathActive) {
-          try {
-            await syncRankMathFocusKeyword((response as any).id, focusKeyword, params.site_id);
-          } catch (error: any) {
-            const message = `Rank Math focus keyword sync failed: ${error.message}`;
-            warnings.push(message);
-            logToFile(message);
-          }
-        } else {
-          logToFile('Rank Math plugin is not active; skipping focus keyword sync.');
-        }
-      }
-
-      const responseWithWarnings =
-        warnings.length > 0 && response && typeof response === 'object' && !Array.isArray(response)
-          ? { ...(response as Record<string, unknown>), _mcp_warnings: warnings }
-          : response;
+      const warnings = newId !== undefined
+        ? await syncRankMathFocusKeywordWithWarnings(focusKeyword, newId, params.site_id)
+        : [];
 
       const responseContent: any[] = [{
         type: 'text',
-        text: JSON.stringify(responseWithWarnings, null, 2)
+        text: JSON.stringify(attachWarnings(response, warnings), null, 2)
       }];
       const droppedMeta = detectDroppedMetaKeys(params.meta, response);
       if (droppedMeta.length > 0) {
@@ -1246,51 +1243,11 @@ export const unifiedContentHandlers = {
 
   update_content: async (params: UpdateContentParams) => {
     try {
-      const input = await processWriteContent(params);
-      const preparedRequest = await prepareContentWriteRequest({
-        operation: 'update',
-        contentType: input.content_type,
-        siteId: input.site_id,
-        input
-      });
-      const itemRequest = attachContentIdToPreparedRequest(preparedRequest, params.id);
-
-      const response = await makeWordPressRequest(
-        'POST',
-        itemRequest.endpoint,
-        itemRequest.data,
-        {
-          siteId: params.site_id,
-          namespace: itemRequest.namespace,
-          retry404With: itemRequest.fallbackOn404
-        }
-      );
-
-      const warnings: string[] = [];
-      const focusKeyword = readFocusKeywordForRankMathSync(preparedRequest.data, input);
-      if (focusKeyword) {
-        const rankMathActive = await isRankMathActive(false, params.site_id);
-        if (rankMathActive) {
-          try {
-            await syncRankMathFocusKeyword(params.id, focusKeyword, params.site_id);
-          } catch (error: any) {
-            const message = `Rank Math focus keyword sync failed: ${error.message}`;
-            warnings.push(message);
-            logToFile(message);
-          }
-        } else {
-          logToFile('Rank Math plugin is not active; skipping focus keyword sync.');
-        }
-      }
-
-      const responseWithWarnings =
-        warnings.length > 0 && response && typeof response === 'object' && !Array.isArray(response)
-          ? { ...(response as Record<string, unknown>), _mcp_warnings: warnings }
-          : response;
+      const { response, warnings } = await executeContentUpdate(params);
 
       const responseContent: any[] = [{
         type: 'text',
-        text: JSON.stringify(responseWithWarnings, null, 2)
+        text: JSON.stringify(attachWarnings(response, warnings), null, 2)
       }];
       const droppedMeta = detectDroppedMetaKeys(params.meta, response);
       if (droppedMeta.length > 0) {
@@ -1506,16 +1463,20 @@ export const unifiedContentHandlers = {
       const { content, contentType } = result;
 
       if (params.update_fields) {
-        const endpoint = await getContentEndpoint(contentType, params.site_id);
-        const updateData = await buildContentUpdateData(
-          params.update_fields,
-          endpoint,
-          content.id,
-          params.site_id
-        );
+        // Route the update through the same contract pipeline as update_content
+        // (contract validation/normalization, content_edit resolution, Rank Math sync).
+        const { response, warnings } = await executeContentUpdate({
+          content_type: contentType,
+          id: content.id,
+          site_id: params.site_id,
+          ...params.update_fields
+        } as UpdateContentParams);
 
-        await makeWordPressRequest('POST', `${endpoint}/${content.id}`, updateData, { siteId: params.site_id });
-        const updatedContent = await fetchContentById(endpoint, content.id, params.site_id, params.include_raw_content || false);
+        // The write response already echoes the saved state (like update_content);
+        // only re-read when include_raw_content needs the context=edit content_raw.
+        const saved = params.include_raw_content
+          ? await fetchContentForType(contentType, content.id, params.site_id, true)
+          : response;
 
         const responseContent: any[] = [{
           type: 'text',
@@ -1525,11 +1486,11 @@ export const unifiedContentHandlers = {
             content_id: content.id,
             original_url: params.url,
             updated: true,
-            content: updatedContent,
-            content_raw: params.include_raw_content ? updatedContent.content_raw : undefined
+            content: attachWarnings(saved, warnings),
+            content_raw: params.include_raw_content ? (saved as any).content_raw : undefined
           }, null, 2)
         }];
-        const droppedMeta = detectDroppedMetaKeys(params.update_fields.meta, updatedContent);
+        const droppedMeta = detectDroppedMetaKeys(params.update_fields.meta, response);
         if (droppedMeta.length > 0) {
           responseContent.unshift({ type: 'text', text: buildDroppedMetaWarning(droppedMeta) });
         }
@@ -1543,7 +1504,7 @@ export const unifiedContentHandlers = {
       }
 
       const responseContent = params.include_raw_content
-        ? await fetchContentById(await getContentEndpoint(contentType, params.site_id), content.id, params.site_id, true)
+        ? await fetchContentForType(contentType, content.id, params.site_id, true)
         : content;
 
       return {
@@ -1556,18 +1517,22 @@ export const unifiedContentHandlers = {
               content_id: content.id,
               original_url: params.url,
               content: responseContent,
-              content_raw: params.include_raw_content ? responseContent.content_raw : undefined
+              content_raw: params.include_raw_content ? (responseContent as any).content_raw : undefined
             }, null, 2)
           }],
           isError: false
         }
       };
     } catch (error: any) {
+      const message = error instanceof ContractValidationError || error instanceof ContractCompatibilityError
+        ? formatContractError(error)
+        : `Error finding content by URL: ${error.message}`;
+
       return {
         toolResult: {
           content: [{
             type: 'text',
-            text: `Error finding content by URL: ${error.message}`
+            text: message
           }],
           isError: true
         }
