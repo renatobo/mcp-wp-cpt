@@ -10,9 +10,10 @@ import { commentTools, commentHandlers } from './comments.js';
 import { sqlQueryTools, sqlQueryHandlers } from './sql-query.js';
 import { siteManagementTools, siteManagementHandlers } from './site-management.js';
 import { contentSummaryTools, contentSummaryHandlers } from './content-summary.js';
+import { enrichToolDefinition } from '../mcp/tool-metadata.js';
 
 // Combine all tools
-export const allTools: Tool[] = [
+const toolDefinitions: Tool[] = [
   ...unifiedContentTools,        // 8 tools (replaces posts, pages, custom-post-types)
   ...unifiedTaxonomyTools,       // 8 tools (replaces categories, custom-taxonomies)
   ...pluginTools,               // ~5 tools
@@ -24,6 +25,8 @@ export const allTools: Tool[] = [
   ...siteManagementTools,       // 3 tools (multi-site support)
   ...contentSummaryTools        // 1 tool (audit/lookup summary)
 ];
+
+export const allTools: Tool[] = toolDefinitions.map(enrichToolDefinition);
 
 // Combine all handlers
 export const toolHandlers = {

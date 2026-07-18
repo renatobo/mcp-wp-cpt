@@ -7,6 +7,32 @@ import { siteManager } from './config/site-manager.js';
 let wpClient: AxiosInstance | undefined;
 
 const DEFAULT_STRIP_FIELDS = ['yoast_head', 'yoast_head_json'];
+const SENSITIVE_LOG_KEYS = /^(authorization|proxy-authorization|cookie|set-cookie|password|passwd|token|access_token|refresh_token|secret|api[_-]?key)$/i;
+const REDACTED_VALUE = '[REDACTED]';
+
+export function redactSensitiveLogData(value: unknown, seen = new WeakSet<object>()): unknown {
+  if (Array.isArray(value)) {
+    return value.map((item) => redactSensitiveLogData(item, seen));
+  }
+
+  if (!value || typeof value !== 'object') {
+    return value;
+  }
+
+  if (seen.has(value)) {
+    return '[CIRCULAR]';
+  }
+  seen.add(value);
+
+  const redacted: Record<string, unknown> = {};
+  for (const [key, nestedValue] of Object.entries(value as Record<string, unknown>)) {
+    redacted[key] = SENSITIVE_LOG_KEYS.test(key)
+      ? REDACTED_VALUE
+      : redactSensitiveLogData(nestedValue, seen);
+  }
+
+  return redacted;
+}
 
 /**
  * Resolve the list of top-level fields to strip from WP REST responses.
@@ -107,7 +133,7 @@ export async function makeWordPressRequest(
 
   // Log data (skip for FormData which can't be stringified)
   if (!options?.isFormData) {
-    logToFile(`Data: ${JSON.stringify(data, null, 2)}`, 'debug');
+    logToFile(`Data: ${JSON.stringify(redactSensitiveLogData(data), null, 2)}`, 'debug');
   } else {
     logToFile('Request contains FormData (not shown in logs)', 'debug');
   }
@@ -137,14 +163,16 @@ export async function makeWordPressRequest(
       requestConfig.data = data;
     }
     
+    const redactedHeaders = redactSensitiveLogData({ ...client.defaults.headers, ...requestConfig.headers });
+    const redactedData = redactSensitiveLogData(data);
     const requestLog = `
 REQUEST:
 URL: ${fullUrl}
 Method: ${method}
 Site: ${options?.siteId || 'default'}
 Namespace: ${namespace}
-Headers: ${JSON.stringify({...client.defaults.headers, ...requestConfig.headers}, null, 2)}
-Data: ${options?.isFormData ? '(FormData not shown)' : JSON.stringify(data, null, 2)}
+Headers: ${JSON.stringify(redactedHeaders, null, 2)}
+Data: ${options?.isFormData ? '(FormData not shown)' : JSON.stringify(redactedData, null, 2)}
 `;
     logToFile(requestLog, 'debug');
 
@@ -153,7 +181,7 @@ Data: ${options?.isFormData ? '(FormData not shown)' : JSON.stringify(data, null
     const responseLog = `
 RESPONSE:
 Status: ${response.status}
-Data: ${JSON.stringify(response.data, null, 2)}
+Data: ${JSON.stringify(redactSensitiveLogData(response.data), null, 2)}
 `;
     logToFile(responseLog, 'debug');
 
@@ -177,7 +205,7 @@ Data: ${JSON.stringify(response.data, null, 2)}
 ERROR:
 Message: ${error.message}
 Status: ${error.response?.status || 'N/A'}
-Data: ${JSON.stringify(error.response?.data || {}, null, 2)}
+Data: ${JSON.stringify(redactSensitiveLogData(error.response?.data || {}), null, 2)}
 `;
     logToFile(errorLog, 'error');
     throw error;

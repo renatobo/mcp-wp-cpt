@@ -51,4 +51,38 @@ describe('tool registry wiring', () => {
       expect(typeof handler, `handler ${name}`).toBe('function');
     }
   });
+
+  it('publishes safety annotations and a structured output schema for every tool', () => {
+    for (const tool of allTools) {
+      expect(tool.annotations, `annotations for ${tool.name}`).toBeDefined();
+      expect(typeof tool.annotations?.readOnlyHint).toBe('boolean');
+      expect(typeof tool.annotations?.destructiveHint).toBe('boolean');
+      expect(typeof tool.annotations?.idempotentHint).toBe('boolean');
+      expect(typeof tool.annotations?.openWorldHint).toBe('boolean');
+      expect(tool.outputSchema?.type, `outputSchema for ${tool.name}`).toBe('object');
+    }
+  });
+
+  it('marks representative read, create, update, and delete tools accurately', () => {
+    const tools = new Map(allTools.map((tool) => [tool.name, tool]));
+
+    expect(tools.get('get_content')?.annotations).toMatchObject({
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true
+    });
+    expect(tools.get('create_content')?.annotations).toMatchObject({
+      readOnlyHint: false,
+      destructiveHint: false
+    });
+    expect(tools.get('update_content')?.annotations).toMatchObject({
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: true
+    });
+    expect(tools.get('delete_content')?.annotations).toMatchObject({
+      readOnlyHint: false,
+      destructiveHint: true
+    });
+  });
 });
