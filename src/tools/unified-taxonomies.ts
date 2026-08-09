@@ -4,6 +4,17 @@ import { makeWordPressRequest, logToFile } from '../wordpress.js';
 import { getContentEndpoint } from './unified-content.js';
 import { z } from 'zod';
 import { prepareGetContentRequest } from '../content/read-preparation.js';
+import {
+  extractPluginObjectTerms,
+  isEmbeddedTermField,
+  normalizeEmbeddedTerms
+} from '../taxonomies/embedded-terms.js';
+
+export {
+  extractPluginObjectTerms,
+  isEmbeddedTermField,
+  normalizeEmbeddedTerms
+} from '../taxonomies/embedded-terms.js';
 
 // Cache for taxonomies, keyed per site, to reduce API calls
 interface TaxonomyCacheEntry {
@@ -33,106 +44,6 @@ async function getTaxonomies(forceRefresh = false, siteId?: string) {
     logToFile(`Error fetching taxonomies: ${error.message}`);
     throw error;
   }
-}
-
-// EventON-style plugin endpoints expose taxonomy terms embedded as label arrays
-// (e.g. event_type: ["Long ride"]) rather than wp/v2 term-ID arrays. Object arrays
-// carrying term_id that are not taxonomies (organizers, related events) are excluded.
-const NON_TAXONOMY_OBJECT_FIELDS = new Set(['organizers', 'organizer', 'related_events', 'faqs']);
-
-export function normalizeEmbeddedTerms(value: unknown): any[] {
-  if (!Array.isArray(value)) {
-    return [];
-  }
-
-  return value.map((entry) => {
-    if (typeof entry === 'string') {
-      return { name: entry };
-    }
-    if (entry && typeof entry === 'object') {
-      const obj = entry as Record<string, unknown>;
-      return {
-        ...(obj.term_id !== undefined ? { id: obj.term_id } : {}),
-        ...(obj.name !== undefined ? { name: obj.name } : {}),
-        ...(obj.slug !== undefined ? { slug: obj.slug } : {})
-      };
-    }
-    return { name: String(entry) };
-  });
-}
-
-// Decides whether a field on a plugin content object represents taxonomy terms.
-export function isEmbeddedTermField(key: string, value: unknown): boolean {
-  if (!Array.isArray(value) || value.length === 0) {
-    return false;
-  }
-  if (value.every((entry) => typeof entry === 'string')) {
-    return true;
-  }
-  if (NON_TAXONOMY_OBJECT_FIELDS.has(key)) {
-    return false;
-  }
-  return value.every((entry) => entry && typeof entry === 'object' && 'term_id' in (entry as object));
-}
-
-// Maps a plugin object field key to its base taxonomy slug. Identifier-bearing
-// companion fields (e.g. event_type_terms, tag_terms) collapse onto the base
-// taxonomy so they don't surface as duplicate taxonomies.
-function fieldToTaxonomyBase(key: string): string {
-  const stripped = key.endsWith('_terms') ? key.slice(0, -'_terms'.length) : key;
-  return stripped === 'tag' || stripped === 'tags' ? 'post_tag' : stripped;
-}
-
-// Candidate field names a plugin object may use for a given taxonomy: a label-only
-// array and an identifier-bearing companion array.
-function embeddedFieldNames(taxonomyBase: string): { label: string; enriched: string } {
-  if (taxonomyBase === 'post_tag') {
-    return { label: 'tags', enriched: 'tag_terms' };
-  }
-  return { label: taxonomyBase, enriched: `${taxonomyBase}_terms` };
-}
-
-// Extracts taxonomy terms embedded directly in a plugin content object, preferring
-// identifier-bearing `*_terms` arrays over label-only arrays for the same taxonomy.
-export function extractPluginObjectTerms(content: any, taxonomy?: string): Record<string, any[]> {
-  const terms: Record<string, any[]> = {};
-
-  if (!content || typeof content !== 'object') {
-    return terms;
-  }
-
-  if (taxonomy) {
-    const { label, enriched } = embeddedFieldNames(taxonomy);
-    const value = isEmbeddedTermField(enriched, content[enriched])
-      ? content[enriched]
-      : isEmbeddedTermField(label, content[label])
-        ? content[label]
-        : undefined;
-    const normalized = value ? normalizeEmbeddedTerms(value) : [];
-    if (normalized.length > 0) {
-      terms[taxonomy] = normalized;
-    }
-    return terms;
-  }
-
-  const chosen = new Map<string, { value: unknown; enriched: boolean }>();
-  for (const [key, value] of Object.entries(content)) {
-    if (!isEmbeddedTermField(key, value)) {
-      continue;
-    }
-    const enriched = key.endsWith('_terms');
-    const base = fieldToTaxonomyBase(key);
-    const existing = chosen.get(base);
-    if (!existing || (enriched && !existing.enriched)) {
-      chosen.set(base, { value, enriched });
-    }
-  }
-
-  for (const [base, { value }] of chosen) {
-    terms[base] = normalizeEmbeddedTerms(value);
-  }
-
-  return terms;
 }
 
 /**

@@ -7,7 +7,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { allTools, toolHandlers } from './tools/index.js';
 import { z } from 'zod';
-import { zodToJsonSchema } from 'zod-to-json-schema';
+import { normalizeToolResult } from './mcp/tool-results.js';
 
 
 // Create MCP server instance.
@@ -32,13 +32,7 @@ for (const tool of allTools) {
     const wrappedHandler = async (args: any) => {
         // The handler functions are already typed with their specific parameter types
         const result = await handler(args);
-        return {
-            content: result.toolResult.content.map((item: { type: string; text: string }) => ({
-                ...item,
-                type: "text" as const
-            })),
-            isError: result.toolResult.isError
-        };
+        return normalizeToolResult(result);
     };
     
     // Tool modules define inputSchema.properties as zod shapes (see CLAUDE.md);
@@ -46,9 +40,16 @@ for (const tool of allTools) {
     const rawShape = tool.inputSchema.properties as z.ZodRawShape;
     // Cast bypasses TS2589: server.tool's generic resolves ShapeOutput<Args>
     // against the SDK's z3|z4 union schema type, exploding instantiation depth.
-    (server.tool as (name: string, description: string, schema: z.ZodRawShape, cb: typeof wrappedHandler) => unknown)(
-        tool.name, tool.description ?? '', rawShape, wrappedHandler
-    );
+    server.registerTool(tool.name, {
+        title: tool.title,
+        description: tool.description ?? '',
+        inputSchema: rawShape,
+        outputSchema: z.object({
+            data: z.unknown().optional(),
+            error: z.object({ message: z.string() }).optional()
+        }),
+        annotations: tool.annotations
+    }, wrappedHandler);
 
 }
 

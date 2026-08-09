@@ -6,6 +6,15 @@ import * as fs from 'fs-extra';
 import * as path from 'path';
 import * as os from 'os';
 import { marked } from 'marked';
+import {
+  applyContentEdit,
+  CONTENT_EDIT_OPERATIONS,
+  ContentEditOperation,
+  ContentEditParams,
+  validateContentEdit
+} from '../content/content-edit.js';
+
+export { applyContentEdit } from '../content/content-edit.js';
 import { siteManager } from '../config/site-manager.js';
 import { listResolvedContentTypeContracts, resolveContentTypeContract } from '../adapters/registry.js';
 import { loadSiteManifests } from '../adapters/manifest-loader.js';
@@ -343,16 +352,6 @@ export async function findContentByUrl(
 // Content format types
 type ContentFormat = 'auto' | 'markdown' | 'html' | 'blocks';
 type DetectedFormat = 'blocks' | 'html' | 'markdown' | 'text';
-const CONTENT_EDIT_OPERATIONS = ['append', 'prepend', 'insert_before', 'insert_after', 'replace'] as const;
-type ContentEditOperation = typeof CONTENT_EDIT_OPERATIONS[number];
-type ContentEditParams = {
-  operation: ContentEditOperation;
-  value: string;
-  target_text?: string;
-  occurrence?: number;
-  content_format?: ContentFormat;
-  convert_to_blocks?: boolean;
-};
 function detectContentFormat(content: string): DetectedFormat {
   if (/<!--\s*wp:/.test(content)) {
     return 'blocks';
@@ -672,77 +671,6 @@ export function buildDroppedMetaWarning(droppedKeys: string[]): string {
     `which the plugins do not expose on the core /wp/v2/ endpoints by default. ` +
     `See README "Meta field limitations" for context.`
   );
-}
-
-function validateContentEdit(edit: ContentEditParams) {
-  const targetedOperations = new Set<ContentEditOperation>(['insert_before', 'insert_after', 'replace']);
-
-  if (targetedOperations.has(edit.operation) && !edit.target_text) {
-    throw new Error(`content_edit.target_text is required for ${edit.operation}`);
-  }
-}
-
-function getTargetMatchIndex(content: string, targetText: string, occurrence?: number): number {
-  const matches: number[] = [];
-  let fromIndex = 0;
-
-  while (true) {
-    const matchIndex = content.indexOf(targetText, fromIndex);
-    if (matchIndex === -1) {
-      break;
-    }
-
-    matches.push(matchIndex);
-    fromIndex = matchIndex + targetText.length;
-  }
-
-  if (matches.length === 0) {
-    throw new Error('content_edit.target_text was not found in the existing content');
-  }
-
-  if (occurrence === undefined) {
-    if (matches.length > 1) {
-      throw new Error(`content_edit.target_text matched ${matches.length} locations. Provide content_edit.occurrence to disambiguate.`);
-    }
-    return matches[0];
-  }
-
-  if (!Number.isInteger(occurrence) || occurrence < 1) {
-    throw new Error('content_edit.occurrence must be a positive integer');
-  }
-
-  const resolvedIndex = matches[occurrence - 1];
-  if (resolvedIndex === undefined) {
-    throw new Error(`content_edit.occurrence ${occurrence} is out of range for ${matches.length} matches`);
-  }
-
-  return resolvedIndex;
-}
-
-export function applyContentEdit(existingContent: string, edit: ContentEditParams): string {
-  validateContentEdit(edit);
-
-  switch (edit.operation) {
-    case 'append':
-      return `${existingContent}${edit.value}`;
-    case 'prepend':
-      return `${edit.value}${existingContent}`;
-    case 'insert_before': {
-      const targetText = edit.target_text as string;
-      const targetIndex = getTargetMatchIndex(existingContent, targetText, edit.occurrence);
-      return `${existingContent.slice(0, targetIndex)}${edit.value}${existingContent.slice(targetIndex)}`;
-    }
-    case 'insert_after': {
-      const targetText = edit.target_text as string;
-      const targetIndex = getTargetMatchIndex(existingContent, targetText, edit.occurrence) + targetText.length;
-      return `${existingContent.slice(0, targetIndex)}${edit.value}${existingContent.slice(targetIndex)}`;
-    }
-    case 'replace': {
-      const targetText = edit.target_text as string;
-      const targetIndex = getTargetMatchIndex(existingContent, targetText, edit.occurrence);
-      return `${existingContent.slice(0, targetIndex)}${edit.value}${existingContent.slice(targetIndex + targetText.length)}`;
-    }
-  }
 }
 
 // Reads the raw content body via the contract-aware route (and 404 fallback) the

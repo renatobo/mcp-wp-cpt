@@ -698,6 +698,30 @@ The repo runs two suites and `npm test` executes both:
 - [Vitest](https://vitest.dev/) tests under `tests/` cover the multi-site `SiteManager` and the MCP tool registry wiring.
 - A `node:test` suite under `test/` covers contract manifest caching, payload shaping, and EventON read/write preparation.
 
+### WordPress 7 least-privilege integration gate
+
+The live WordPress 7 suite is disabled unless explicitly enabled. Use a disposable
+WordPress 7.x test site and an Author-level user with a dedicated Application
+Password; do not use an administrator account or production site.
+
+```bash
+RUN_WORDPRESS_7_INTEGRATION=true \
+WORDPRESS_7_TEST_URL=https://wp7-test.example.com \
+WORDPRESS_7_TEST_USERNAME=mcp-integration-author \
+WORDPRESS_7_TEST_PASSWORD=xxxx-xxxx-xxxx-xxxx \
+npm test
+```
+
+The suite verifies that the target reports WordPress 7.x, exercises a draft-post
+create/read/update/trash lifecycle, cleans up the test post, and confirms that the
+account cannot administer plugins or enumerate users. Credentials must only be
+provided through the environment and must never be committed.
+
+The plugin-specific WPRM round-trip suite is also opt-in. Set
+`RUN_WPRM_INTEGRATION=true` together with the ordinary `WORDPRESS_API_URL`,
+`WORDPRESS_USERNAME`, and `WORDPRESS_PASSWORD` variables to run it against a
+disposable site with WP Recipe Maker installed.
+
 ```bash
 npm test            # one-shot run (vitest + node:test)
 npm run test:watch  # vitest watch mode

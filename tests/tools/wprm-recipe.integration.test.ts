@@ -9,6 +9,7 @@ import { unifiedContentHandlers } from '../../src/tools/unified-content.js';
 dotenv.config();
 
 const hasCreds =
+  process.env.RUN_WPRM_INTEGRATION === 'true' &&
   !!process.env.WORDPRESS_API_URL &&
   !!process.env.WORDPRESS_USERNAME &&
   !!process.env.WORDPRESS_PASSWORD;

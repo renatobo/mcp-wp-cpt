@@ -1,9 +1,13 @@
 // src/tools/plugins.ts
 import { Tool } from '@modelcontextprotocol/sdk/types.js';
 import { makeWordPressRequest } from '../wordpress.js';
-import { WPPlugin } from '../types/wordpress-types.js';
 import { z } from 'zod';
-import { zodToJsonSchema } from 'zod-to-json-schema';
+import { toolError, toolSuccess } from '../mcp/tool-results.js';
+
+const siteIdSchema = z.string().optional().describe('Site ID (for multi-site setups)');
+const pluginFileSchema = z.string().min(1).describe(
+  "Plugin file returned by list_plugins (for example 'akismet/akismet.php')"
+);
 
 // Note: Plugin operations require authentication with admin privileges
 // and use a different endpoint than the standard WP API (wp-json/wp/v2/plugins)
@@ -11,24 +15,29 @@ import { zodToJsonSchema } from 'zod-to-json-schema';
 // Make schema empty since the WordPress REST API plugins endpoint doesn't accept parameters
 // in the same way as other endpoints
 const listPluginsSchema = z.object({
-  status: z.enum(['active', 'inactive']).optional().default('active').describe("Filter plugins by status (active, inactive)")
+  status: z.enum(['active', 'inactive']).optional().default('active').describe("Filter plugins by status (active, inactive)"),
+  site_id: siteIdSchema
 }).strict();
 
 const getPluginSchema = z.object({
-  plugin: z.string().describe("Plugin slug (e.g., 'akismet', 'elementor', 'wordpress-seo')")
+  plugin: pluginFileSchema,
+  site_id: siteIdSchema
 }).strict();
 
 const activatePluginSchema = z.object({
-  plugin: z.string().describe("Plugin slug (e.g., 'akismet', 'elementor', 'wordpress-seo')")
+  plugin: pluginFileSchema,
+  site_id: siteIdSchema
 }).strict();
 
 const deactivatePluginSchema = z.object({
-  plugin: z.string().describe("Plugin slug (e.g., 'akismet', 'elementor', 'wordpress-seo')")
+  plugin: pluginFileSchema,
+  site_id: siteIdSchema
 }).strict();
 
 const createPluginSchema = z.object({
   slug: z.string({ error: "Plugin slug is required" }).describe("WordPress.org plugin directory slug, e.g., 'akismet', 'elementor', 'wordpress-seo'"),
-  status: z.enum(['inactive', 'active']).optional().default('active').describe("Plugin activation status")
+  status: z.enum(['inactive', 'active']).optional().default('active').describe("Plugin activation status"),
+  site_id: siteIdSchema
 }).strict();
 
 type ListPluginsParams = z.infer<typeof listPluginsSchema>;
@@ -36,6 +45,9 @@ type GetPluginParams = z.infer<typeof getPluginSchema>;
 type ActivatePluginParams = z.infer<typeof activatePluginSchema>;
 type DeactivatePluginParams = z.infer<typeof deactivatePluginSchema>;
 type CreatePluginParams = z.infer<typeof createPluginSchema>;
+
+export const getPluginEndpoint = (pluginFile: string): string =>
+  `plugins/${encodeURIComponent(pluginFile)}`;
 
 // Define tool set for plugin operations
 export const pluginTools: Tool[] = [
@@ -70,92 +82,44 @@ export const pluginTools: Tool[] = [
 export const pluginHandlers = {
   list_plugins: async (params: z.infer<typeof listPluginsSchema>) => {
     try {
-      const response = await makeWordPressRequest("GET", "plugins", params);
-      return {
-        toolResult: {
-          content: [{ type: "text", text: JSON.stringify(response, null, 2) }]
-        }
-      };
-    } catch (error: any) {
-      const errorMessage = error.response?.data?.message || error.message;
-      return {
-        toolResult: {
-          isError: true,
-          content: [{ type: "text", text: `Error listing plugins: ${errorMessage}` }]
-        }
-      };
+      const { site_id, ...query } = params;
+      const response = await makeWordPressRequest('GET', 'plugins', query, { siteId: site_id });
+      return toolSuccess(response);
+    } catch (error: unknown) {
+      return toolError('listing plugins', error);
     }
   },
   get_plugin: async (params: z.infer<typeof getPluginSchema>) => {
     try {
-      const response = await makeWordPressRequest("GET", `plugins/${params.plugin}`);
-      return {
-        toolResult: {
-          content: [{ type: "text", text: JSON.stringify(response, null, 2) }]
-        }
-      };
-    } catch (error: any) {
-      const errorMessage = error.response?.data?.message || error.message;
-      return {
-        toolResult: {
-          isError: true,
-          content: [{ type: "text", text: `Error retrieving plugin: ${errorMessage}` }]
-        }
-      };
+      const response = await makeWordPressRequest('GET', getPluginEndpoint(params.plugin), undefined, { siteId: params.site_id });
+      return toolSuccess(response);
+    } catch (error: unknown) {
+      return toolError('retrieving plugin', error);
     }
   },
   activate_plugin: async (params: z.infer<typeof activatePluginSchema>) => {
     try {
-      const response = await makeWordPressRequest("POST", `plugins/${params.plugin}/activate`, params);
-      return {
-        toolResult: {
-          content: [{ type: "text", text: JSON.stringify(response, null, 2) }]
-        }
-      };
-    } catch (error: any) {
-      const errorMessage = error.response?.data?.message || error.message;
-      return {
-        toolResult: {
-          isError: true,
-          content: [{ type: "text", text: `Error activating plugin: ${errorMessage}` }]
-        }
-      };
+      const response = await makeWordPressRequest('POST', getPluginEndpoint(params.plugin), { status: 'active' }, { siteId: params.site_id });
+      return toolSuccess(response);
+    } catch (error: unknown) {
+      return toolError('activating plugin', error);
     }
   },
   deactivate_plugin: async (params: z.infer<typeof deactivatePluginSchema>) => {
     try {
-      const response = await makeWordPressRequest("POST", `plugins/${params.plugin}/deactivate`, params);
-      return {
-        toolResult: {
-          content: [{ type: "text", text: JSON.stringify(response, null, 2) }]
-        }
-      };
-    } catch (error: any) {
-      const errorMessage = error.response?.data?.message || error.message;
-      return {
-        toolResult: {
-          isError: true,
-          content: [{ type: "text", text: `Error deactivating plugin: ${errorMessage}` }]
-        }
-      };
+      const response = await makeWordPressRequest('POST', getPluginEndpoint(params.plugin), { status: 'inactive' }, { siteId: params.site_id });
+      return toolSuccess(response);
+    } catch (error: unknown) {
+      return toolError('deactivating plugin', error);
     }
   },
   create_plugin: async (params: z.infer<typeof createPluginSchema>) => {
     try {
-      const response = await makeWordPressRequest("POST", "plugins", params);
-      return {
-        toolResult: {
-          content: [{ type: "text", text: JSON.stringify(response, null, 2) }]
-        }
-      };
-    } catch (error: any) {
-      const errorMessage = error.response?.data?.message || error.message;
-      return {
-        toolResult: {
-          isError: true,
-          content: [{ type: "text", text: `Error creating plugin: ${errorMessage}` }]
-        }
-      };
+      const { site_id, ...data } = params;
+      const response = await makeWordPressRequest('POST', 'plugins', data, { siteId: site_id });
+      return toolSuccess(response);
+    } catch (error: unknown) {
+      return toolError('creating plugin', error);
     }
   }
 };
