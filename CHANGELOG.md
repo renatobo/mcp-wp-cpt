@@ -5,6 +5,52 @@ All notable changes to `@instawp/mcp-wp` are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-08-19
+
+### Added
+- **`WORDPRESS_USER_AGENT`.** Sets the user-agent on *every* outbound request — the WordPress REST
+  client behind all tools, the SQL endpoint, both api.wordpress.org lookups, and remote media
+  downloads. Unset (the default) keeps axios's own `axios/<version>`, so behaviour is unchanged
+  unless you set it; an empty or whitespace-only value is treated as unset, since some edges block an
+  empty user-agent too. For users behind a CDN/WAF that rejects the default. (#30)
+
+### Changed
+- **`execute_sql_query` explains an HTTP 403 instead of just reporting it.** A 403 may be WordPress
+  rejecting the credentials *or* a CDN/WAF challenge page returned before the request reached
+  WordPress; the error now says so, shows the response body (truncated) so the two can be told apart,
+  and points at `WORDPRESS_USER_AGENT`. The bare `Request failed with status code 403` is what made
+  #28 hard to diagnose. (#30)
+
+### Security
+- **Bumped `vitest` to `^4.1.11`** (dev dependency), clearing GHSA-5xrq-8626-4rwp — a critical
+  advisory against `vitest < 3.2.6` (arbitrary file read/execute while the Vitest UI server is
+  listening) — along with four moderate/high advisories in the bundled `vite` / `vite-node` /
+  `esbuild` / `@vitest/mocker` chain. Dev-only: none of these ship in the published package.
+
+## [0.1.2] - 2026-08-19
+
+### Added
+- **Automated npm publishing.** Pushing a `vX.Y.Z` tag now builds, tests and publishes the
+  package with [provenance](https://docs.npmjs.com/generating-provenance-statements) via
+  `.github/workflows/release.yml`, and verifies the registry actually serves the new version.
+  Previously the package was published by hand, so a merged fix could sit unpublished
+  indefinitely. See "Releasing" in the README. (#32)
+- `repository`, `homepage` and `bugs` fields in `package.json` — the `repository` field is
+  required for provenance and was missing. (#32)
+
+### Note
+- 0.1.1 was tagged and released on GitHub but never published to npm; this is the first
+  published release containing the `execute_sql_query` User-Agent fix from #28.
+
+## [0.1.1] - 2026-08-19
+
+### Fixed
+- **`execute_sql_query` no longer sends `User-Agent: Mozilla/5.0`.** The bare
+  `Mozilla/5.0` is a well-known bot signature that CDNs/WAFs (WP Engine,
+  Cloudflare bot protection) block with a 403 challenge page, so the tool failed
+  against healthy, correctly authenticated SQL endpoints. It now sends no
+  `User-Agent` override, matching every other tool in the package. (#28)
+
 ## [0.1.0] - 2026-06-15
 
 ### Added
@@ -48,4 +94,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Documented meta-field limitations for SEO plugin keys. (#19)
 - Documented WP Recipe Maker (WPRM) recipe-card support via `custom_fields`. (#20)
 
+[0.2.0]: https://github.com/InstaWP/mcp-wp/compare/v0.1.2...v0.2.0
+[0.1.2]: https://github.com/InstaWP/mcp-wp/compare/v0.1.1...v0.1.2
+[0.1.1]: https://github.com/InstaWP/mcp-wp/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/InstaWP/mcp-wp/releases/tag/v0.1.0
