@@ -126,6 +126,60 @@ test('contract interpreter validates and normalizes structured create input', ()
   assert.deepEqual(prepared.data.location, { name: 'HQ' });
 });
 
+test('contract create requirements accept a documented top-level title without permitting fields.title', () => {
+  const titleRequiredContract: ContentTypeContract = {
+    ...contract,
+    validation_rules: {
+      ...contract.validation_rules,
+      required_for_create: ['title', 'start_date', 'start_time']
+    }
+  };
+
+  const prepared = prepareContractWriteRequest(
+    {
+      title: 'Ride to Big Bear',
+      fields: {
+        start_date: '2026-04-01',
+        start_time: '08:00'
+      }
+    },
+    {
+      siteId: 'default',
+      contentType: 'ajde_events',
+      operation: 'create',
+      manifest,
+      contract: titleRequiredContract
+    }
+  );
+
+  assert.equal(prepared.data.title, 'Ride to Big Bear');
+
+  assert.throws(
+    () => prepareContractWriteRequest(
+      {
+        title: 'Ride to Big Bear',
+        fields: {
+          title: 'Incorrect nested title',
+          start_date: '2026-04-01',
+          start_time: '08:00'
+        }
+      },
+      {
+        siteId: 'default',
+        contentType: 'ajde_events',
+        operation: 'create',
+        manifest,
+        contract: titleRequiredContract
+      }
+    ),
+    (error: unknown) => {
+      assert.ok(error instanceof ContractValidationError);
+      assert.ok(error.validationIssues.includes('`fields.title` is not defined by the contract.'));
+      return true;
+    }
+  );
+});
+
 test('contract update requests append the content ID to primary and fallback endpoints', () => {
   const prepared = prepareContractWriteRequest(
     {

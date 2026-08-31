@@ -66,7 +66,7 @@ export function prepareContractWriteRequest(
   const writeMode = context.contract.preferred_write_mode || 'fields';
   const contractFields = context.contract.fields || [];
   const fields = input.fields || {};
-  const validationIssues = validateStructuredFields(fields, contractFields, context);
+  const validationIssues = validateStructuredFields(fields, input, contractFields, context);
 
   if (validationIssues.length > 0) {
     throw new ContractValidationError(
@@ -141,6 +141,7 @@ function collectFieldDefinitionIssues(
 
 function validateStructuredFields(
   fields: Record<string, unknown>,
+  input: AdaptedWriteInput,
   fieldDefinitions: ContentTypeFieldDefinition[],
   context: ContractInterpreterContext
 ): string[] {
@@ -165,8 +166,9 @@ function validateStructuredFields(
 
   const requiredByRule = getStringArray(validationRules, `required_for_${context.operation}`);
   for (const key of requiredByRule) {
-    if (readFieldValueByKey(fields, fieldMap, key) === undefined) {
-      issues.push(`\`fields.${key}\` is required for ${context.operation}.`);
+    if (readContractValueByKey(fields, input, fieldMap, key) === undefined) {
+      const path = fieldMap.has(key) ? `fields.${key}` : key;
+      issues.push(`\`${path}\` is required for ${context.operation}.`);
     }
   }
 
@@ -424,6 +426,22 @@ function readFieldValueByKey(
   }
 
   return readFieldValue(value, definition);
+}
+
+function readContractValueByKey(
+  fields: Record<string, unknown>,
+  input: AdaptedWriteInput,
+  fieldMap: Map<string, ContentTypeFieldDefinition>,
+  key: string
+): unknown {
+  const definition = fieldMap.get(key);
+  if (definition) {
+    return readFieldValue(fields, definition);
+  }
+
+  return Object.prototype.hasOwnProperty.call(input, key)
+    ? input[key as keyof AdaptedWriteInput]
+    : undefined;
 }
 
 function getStringArray(
