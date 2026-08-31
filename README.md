@@ -387,7 +387,7 @@ Notes:
 
 For contract-backed content types, use `describe_content_type` before writing so the MCP client can inspect the contract, field list, validation rules, execution readiness, and examples returned by the site.
 
-The first contract exercised is EventON APIfy for `ajde_events`. Its manifest is discovered from `GET /wp-json/eventonapify/v1/mcp-schema`, while the actual content writes still go to `wp/v2/ajde_events`.
+The first contract exercised is EventON APIfy for `ajde_events`. Its manifest is discovered from `GET /wp-json/eventonapify/v1/mcp-schema`; structured creates and updates use `eventonapify/v1/events` so EventON metadata and term assignments persist transactionally.
 
 Plugin authors should follow [PLUGIN_CONTRACT_REQUIREMENTS.md](./PLUGIN_CONTRACT_REQUIREMENTS.md) when publishing a manifest for this server.
 

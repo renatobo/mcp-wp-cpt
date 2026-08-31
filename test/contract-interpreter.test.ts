@@ -111,12 +111,9 @@ test('contract interpreter validates and normalizes structured create input', ()
     }
   );
 
-  assert.equal(prepared.endpoint, 'ajde_events');
-  assert.equal(prepared.namespace, 'wp/v2');
-  assert.deepEqual(prepared.fallbackOn404, {
-    endpoint: 'events',
-    namespace: 'eventonapify/v1'
-  });
+  assert.equal(prepared.endpoint, 'events');
+  assert.equal(prepared.namespace, 'eventonapify/v1');
+  assert.equal(prepared.fallbackOn404, undefined);
   assert.equal(prepared.data.title, 'Launch Party');
   assert.equal(prepared.data.slug, 'custom-launch-party');
   assert.equal(prepared.data.status, 'draft');
@@ -201,13 +198,10 @@ test('contract update requests append the content ID to primary and fallback end
 
   const itemRequest = attachContentIdToPreparedRequest(prepared, 123);
 
-  assert.equal(itemRequest.endpoint, 'ajde_events/123');
-  assert.equal(itemRequest.namespace, 'wp/v2');
+  assert.equal(itemRequest.endpoint, 'events/123');
+  assert.equal(itemRequest.namespace, 'eventonapify/v1');
   assert.equal(itemRequest.data.slug, 'updated-launch-party');
-  assert.deepEqual(itemRequest.fallbackOn404, {
-    endpoint: 'events/123',
-    namespace: 'eventonapify/v1'
-  });
+  assert.equal(itemRequest.fallbackOn404, undefined);
 });
 
 test('contract interpreter returns actionable validation errors', () => {

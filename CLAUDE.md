@@ -204,7 +204,7 @@ When a content type is contract-backed, `create_content` and `update_content` ca
 2. `describe_content_type`
 3. `create_content` or `update_content`
 
-For EventON APIfy, manifest discovery happens at `eventonapify/v1/mcp-schema`, while write operations still target `wp/v2/ajde_events`.
+For EventON APIfy, manifest discovery happens at `eventonapify/v1/mcp-schema`; structured `ajde_events` writes target `eventonapify/v1/events` so EventON metadata and term assignments persist transactionally.
 
 Targeted content edits are also supported through `content_edit` on `update_content` and `find_content_by_url.update_fields`:
 

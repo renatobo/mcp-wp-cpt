@@ -168,3 +168,26 @@ export function getPreferredReadEndpoint(args: {
     fallbackOn404: getDefensiveEndpointFallback(args)
   };
 }
+
+// EventON's wp/v2 compatibility route creates the post but is not the
+// transactional EventON writer. Contract-backed writes must use the APIfy
+// events endpoint, which persists EventON meta and term assignments together.
+export function getPreferredWriteEndpoint(args: {
+  contentType: string;
+  provider?: string;
+  endpoint: string;
+  namespace?: string;
+}): { endpoint: string; namespace?: string; fallbackOn404?: { endpoint: string; namespace?: string } } {
+  if (args.contentType === 'ajde_events' && args.provider === 'eventon-apify') {
+    return {
+      endpoint: 'events',
+      namespace: 'eventonapify/v1'
+    };
+  }
+
+  return {
+    endpoint: args.endpoint,
+    namespace: args.namespace,
+    fallbackOn404: getDefensiveEndpointFallback(args)
+  };
+}

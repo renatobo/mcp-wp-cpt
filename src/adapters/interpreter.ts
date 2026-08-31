@@ -1,7 +1,7 @@
 import { buildBaseContentPayload } from '../content/payloads.js';
 import {
   getContentEndpoint,
-  getDefensiveEndpointFallback,
+  getPreferredWriteEndpoint,
   splitNamespacedEndpoint
 } from '../content/utils.js';
 import {
@@ -87,16 +87,17 @@ export function prepareContractWriteRequest(
     context.contract.preferred_endpoint,
     getContentEndpoint(context.contentType)
   );
+  const preferredWrite = getPreferredWriteEndpoint({
+    contentType: context.contentType,
+    provider: context.manifest.provider,
+    endpoint: endpointInfo.endpoint,
+    namespace: endpointInfo.namespace
+  });
 
   return {
-    endpoint: endpointInfo.endpoint,
-    namespace: endpointInfo.namespace,
-    fallbackOn404: getDefensiveEndpointFallback({
-      contentType: context.contentType,
-      provider: context.manifest.provider,
-      endpoint: endpointInfo.endpoint,
-      namespace: endpointInfo.namespace
-    }),
+    endpoint: preferredWrite.endpoint,
+    namespace: preferredWrite.namespace,
+    fallbackOn404: preferredWrite.fallbackOn404,
     data: payload,
     warnings: []
   };

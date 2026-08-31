@@ -28,6 +28,7 @@ import {
 import { extractContentCollection, findItemBySlug } from '../content/utils.js';
 import { prepareGetContentRequest, prepareListContentRequest } from '../content/read-preparation.js';
 import { ContractCompatibilityError, ContractValidationError } from '../adapters/types.js';
+import { assertEventONWritePersistence } from '../content/eventon-write-verification.js';
 
 const CACHE_DIR = process.env.UNIFIED_CONTENT_CACHE_DIR
   ? path.resolve(process.env.UNIFIED_CONTENT_CACHE_DIR)
@@ -596,16 +597,35 @@ async function executeContentUpdate(params: UpdateContentParams): Promise<{ resp
   });
   const itemRequest = attachContentIdToPreparedRequest(preparedRequest, params.id);
 
-  const response = await makeWordPressRequest('POST', itemRequest.endpoint, itemRequest.data, {
+  const writeResponse = await makeWordPressRequest('POST', itemRequest.endpoint, itemRequest.data, {
     siteId: params.site_id,
     namespace: itemRequest.namespace,
     retry404With: itemRequest.fallbackOn404
   });
+  const response = await verifyEventONWrite(input, writeResponse);
 
   const focusKeyword = readFocusKeywordForRankMathSync(preparedRequest.data, input);
   const warnings = await syncRankMathFocusKeywordWithWarnings(focusKeyword, params.id, params.site_id);
 
   return { response, warnings };
+}
+
+async function verifyEventONWrite(input: { content_type: string; site_id?: string; fields?: Record<string, unknown>; featured_media?: number }, writeResponse: any): Promise<any> {
+  if (input.content_type !== 'ajde_events') {
+    return writeResponse;
+  }
+
+  const eventId = writeResponse && typeof writeResponse === 'object' ? writeResponse.id : undefined;
+  if (typeof eventId !== 'number') {
+    throw new Error('EventON write did not return a numeric event ID for persistence verification.');
+  }
+
+  const persisted = await makeWordPressRequest('GET', `events/${eventId}`, undefined, {
+    siteId: input.site_id,
+    namespace: 'eventonapify/v1'
+  });
+  assertEventONWritePersistence(input, persisted);
+  return persisted;
 }
 
 // Contract-aware read used by get_content and find_content_by_url, optionally
@@ -1122,11 +1142,12 @@ export const unifiedContentHandlers = {
         siteId: input.site_id,
         input
       });
-      const response = await makeWordPressRequest('POST', preparedRequest.endpoint, preparedRequest.data, {
+      const writeResponse = await makeWordPressRequest('POST', preparedRequest.endpoint, preparedRequest.data, {
         siteId: params.site_id,
         namespace: preparedRequest.namespace,
         retry404With: preparedRequest.fallbackOn404
       });
+      const response = await verifyEventONWrite(input, writeResponse);
 
       // Only sync when the create response carries a numeric id to target.
       const newId = response && typeof response === 'object' && typeof (response as any).id === 'number'
