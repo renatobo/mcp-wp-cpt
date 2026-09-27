@@ -309,6 +309,8 @@ The current server supports these cross-field rules in `validation_rules`:
 - `required_for_update`
 - `required_together`
 - `one_of_required`
+- `one_of_required_for_create`
+- `one_of_required_for_update`
 
 Example:
 
@@ -327,7 +329,13 @@ Meaning:
 - `required_for_create`: each listed field is required on create.
 - `required_for_update`: each listed field is required on update.
 - `required_together`: if one field in a group is present, all must be present.
-- `one_of_required`: at least one field in the group must be present.
+- `one_of_required`: at least one field in the group must be present, on every operation.
+- `one_of_required_for_create` / `one_of_required_for_update`: the same, for one operation only,
+  e.g. `"one_of_required_for_create": [["start_date", "start_at"]]`.
+
+Field definitions may publish a JSON-Schema type array (`"type": ["string", "number"]`) to accept
+several input types, and `also_accepts` hints: `number` for numeric input on a string field, and
+`comma_separated_string` on an array field, which the server splits into trimmed, non-empty items.
 
 ## Examples
 

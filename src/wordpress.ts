@@ -1,7 +1,7 @@
 // src/wordpress.ts
 import * as dotenv from 'dotenv';
 import axios, { AxiosInstance, AxiosRequestConfig } from 'axios';
-import { siteManager } from './config/site-manager.js';
+import { getRequestTimeoutMs, siteManager } from './config/site-manager.js';
 import { userAgentHeader } from './config/user-agent.js';
 
 // Legacy global WordPress API client instance for backward compatibility
@@ -99,16 +99,83 @@ export function logToFile(message: string, level: 'debug' | 'info' | 'error' = '
   }
 }
 
+/**
+ * Endpoints must stay relative to the site's REST namespace. Rejects absolute
+ * URLs, protocol-relative URLs and `..` segments, which would otherwise send the
+ * Basic auth header to another host or escape the namespace. Each path segment is
+ * percent-decoded first, so encoded dots or slashes (`%2e%2e%2f`) are caught too;
+ * malformed encoding is rejected.
+ */
+export function assertRelativeEndpoint(endpoint: string): void {
+  const pathPart = endpoint.split(/[?#]/)[0];
+  const isUnsafeSegment = (segment: string) => {
+    let decoded: string;
+    try {
+      decoded = decodeURIComponent(segment);
+    } catch {
+      return true;
+    }
+    return (
+      decoded === '..' ||
+      decoded === '.' ||
+      decoded.includes('/') ||
+      decoded.includes('\\') ||
+      // Unresolved endpoint template placeholders such as `{event_id}`.
+      decoded.includes('{') ||
+      decoded.includes('}')
+    );
+  };
+
+  if (
+    endpoint.includes('://') ||
+    endpoint.startsWith('//') ||
+    endpoint.includes('\\') ||
+    pathPart.split('/').some(isUnsafeSegment)
+  ) {
+    throw new Error(`Refusing WordPress request to unsafe endpoint "${endpoint}"`);
+  }
+}
+
 export interface WordPressRequestOptions {
   headers?: Record<string, string>;
   isFormData?: boolean;
   rawResponse?: boolean;
   siteId?: string;
   namespace?: string;
-  retry404With?: {
-    endpoint: string;
-    namespace?: string;
-  };
+  retry404With?: RequestFallback;
+}
+
+/**
+ * Alternate route tried when the primary request fails with a 404 (e.g. a plugin
+ * namespace that is not registered). `on403Codes` also retries a 403 whose
+ * WordPress error code is listed (e.g. a plugin API that is switched off while
+ * the native route still works). `data` replaces the request data for the retry,
+ * for routes whose query vocabulary differs from the primary one.
+ */
+export interface RequestFallback {
+  endpoint: string;
+  namespace?: string;
+  on403Codes?: string[];
+  data?: any;
+}
+
+function readWordPressErrorCode(error: any): string | undefined {
+  const code = error?.response?.data?.code;
+  return typeof code === 'string' ? code : undefined;
+}
+
+export function shouldRetryWithFallback(error: unknown, fallback?: RequestFallback): boolean {
+  if (!fallback || !axios.isAxiosError(error)) {
+    return false;
+  }
+
+  const status = error.response?.status;
+  if (status === 404) {
+    return true;
+  }
+
+  const code = readWordPressErrorCode(error);
+  return status === 403 && code !== undefined && Boolean(fallback.on403Codes?.includes(code));
 }
 
 /**
@@ -127,11 +194,6 @@ export async function makeWordPressRequest(
 ) {
   const namespace = options?.namespace || 'wp/v2';
 
-  // Get the appropriate client for the site
-  const client = options?.siteId 
-    ? await siteManager.getClient(options.siteId, namespace)
-    : (wpClient && namespace === 'wp/v2' ? wpClient : await siteManager.getClient(undefined, namespace));
-
   // Log data (skip for FormData which can't be stringified)
   if (!options?.isFormData) {
     logToFile(`Data: ${JSON.stringify(redactSensitiveLogData(data), null, 2)}`, 'debug');
@@ -139,10 +201,18 @@ export async function makeWordPressRequest(
     logToFile('Request contains FormData (not shown in logs)', 'debug');
   }
   
+  assertRelativeEndpoint(endpoint);
+
   // Handle potential leading slash in endpoint
   const path = endpoint.startsWith('/') ? endpoint.substring(1) : endpoint;
 
   try {
+    // Client acquisition probes `GET <namespace>/`, so it runs inside the try:
+    // a missing plugin namespace (404) must reach the fallback below.
+    const client = options?.siteId
+      ? await siteManager.getClient(options.siteId, namespace)
+      : (wpClient && namespace === 'wp/v2' ? wpClient : await siteManager.getClient(undefined, namespace));
+
     const fullUrl = `${client.defaults.baseURL}${path}`;
     
     // Prepare request config
@@ -190,12 +260,15 @@ Data: ${JSON.stringify(redactSensitiveLogData(response.data), null, 2)}
     const stripFields = resolveStripFields(process.env.MCP_WP_STRIP_FIELDS);
     return trimResponseFields(response.data, stripFields);
   } catch (error: any) {
-    if (axios.isAxiosError(error) && error.response?.status === 404 && options?.retry404With) {
+    if (options?.retry404With && shouldRetryWithFallback(error, options.retry404With)) {
       logToFile(
-        `Retrying ${method} ${path} against fallback namespace ${options.retry404With.namespace || 'wp/v2'} endpoint ${options.retry404With.endpoint}`
+        `Retrying ${method} ${path} (status ${error.response?.status}) against fallback namespace ${options.retry404With.namespace || 'wp/v2'} endpoint ${options.retry404With.endpoint}`
       );
 
-      return makeWordPressRequest(method, options.retry404With.endpoint, data, {
+      const fallbackData = Object.prototype.hasOwnProperty.call(options.retry404With, 'data')
+        ? options.retry404With.data
+        : data;
+      return makeWordPressRequest(method, options.retry404With.endpoint, fallbackData, {
         ...options,
         namespace: options.retry404With.namespace,
         retry404With: undefined
@@ -256,6 +329,7 @@ Data: ${JSON.stringify(requestData, null, 2)}
     logToFile(requestLog, 'debug');
 
     const response = await axios.post(apiUrl, requestData, {
+      timeout: getRequestTimeoutMs(),
       headers: {
         'Content-Type': 'application/json',
         ...userAgentHeader()

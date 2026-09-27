@@ -202,7 +202,7 @@ All content and taxonomy tools support an optional `site_id` parameter to target
 
 Handles ALL content types (posts, pages, custom post types) with a single set of intelligent tools:
 
-- `list_content`: List any content type with filtering and pagination
+- `list_content`: List any content type with filtering and pagination. Returns compact item summaries by default (see [Response Trimming](#response-trimming))
 - `get_content`: Get specific content by ID and type
 - `create_content`: Create new content of any type
 - `update_content`: Update existing content of any type, including targeted partial edits
@@ -230,7 +230,7 @@ Handles ALL taxonomies (categories, tags, custom taxonomies) with a single set o
 *   **Media:**
     *   `list_media`: List all media items (supports pagination and searching).
     *   `get_media`: Retrieve a specific media item by ID.
-    *   `create_media`: Create a new media item from a URL.
+    *   `create_media`: Create a new media item from a URL (`source_url`) or a local file (`file_path`). See [Media Uploads](#media-uploads) for the limits on both.
     *   `update_media`: Update an existing media item.
     *   `delete_media`: Delete a media item.
 *   **Users:**
@@ -467,7 +467,7 @@ and reports an error if the terms were not actually saved.
 
 Sites running [WP Recipe Maker](https://wordpress.org/plugins/wp-recipe-maker/) (WPRM) store recipe cards in a separate `wprm_recipe` custom post type referenced by shortcode from the surrounding blog post. The unified content tools handle these recipes directly — no recipe-specific tool family is needed.
 
-**Reading recipes** — `get_content`, `list_content`, `find_content_by_url`, and `get_content_by_slug` all work with `content_type: "wprm_recipe"`. WPRM exposes the full structured recipe payload as a `recipe` field on the REST response, including ingredients, instructions, times, equipment, nutrition, notes, and rating.
+**Reading recipes**: `get_content`, `list_content`, `find_content_by_url`, and `get_content_by_slug` all work with `content_type: "wprm_recipe"`. WPRM exposes the full structured recipe payload as a `recipe` field on the REST response, including ingredients, instructions, times, equipment, nutrition, notes, and rating. `list_content` and `get_content_by_slug` return compact summaries by default, so pass `fields: ["id", "slug", "recipe"]` or `fields: "full"` to get it there.
 
 **Writing recipes** — pass the recipe payload via `custom_fields.recipe` on `create_content` or `update_content`. WPRM hooks into the WordPress REST insert action (`rest_insert_wprm_recipe`) and reads `recipe` from the request body root, so any field documented by WPRM's data model is accepted.
 
@@ -593,7 +593,7 @@ WORDPRESS_3_ID=development
 
 The server supports up to 10 sites. When using multi-site configuration, all tools accept an optional `site_id` parameter to target specific sites.
 
-Contract manifests are cached per site, so multi-site setups can safely expose different plugin contracts. Use `refresh_cache: true` on `discover_content_types` or `describe_content_type` after plugin updates.
+Contract manifests are cached per site, so multi-site setups can safely expose different plugin contracts. Use `refresh_cache: true` on `discover_content_types`, `describe_content_type`, or `list_content` after plugin updates.
 
 ## Using with npx and .env file
 
@@ -637,6 +637,30 @@ Leave it unset unless a CDN or WAF in front of your site rejects the default; an
 whitespace-only value is treated as unset. Avoid a bare `Mozilla/5.0` — it is a well-known bot
 signature and is exactly what several edges block (see #28), which is why nothing here sends one.
 
+## Media Uploads
+
+`create_media` guards both of its sources:
+
+- **`file_path`** is disabled until you set `WORDPRESS_MEDIA_UPLOAD_DIRS` to a comma-separated list
+  of absolute directories. The path is resolved with `realpath`, so `..` and symlinks cannot escape
+  those directories. Hidden files and dot-directories, extensionless files, and non-regular files
+  are rejected.
+- **`source_url`** accepts only `http`/`https`. The host must resolve to public addresses: loopback,
+  private, link-local (including `169.254.169.254` cloud metadata), CGNAT, multicast, and reserved
+  ranges are blocked, for IPv4, IPv6, and IPv4-mapped IPv6. Redirects are followed manually (at most
+  3), re-checking each hop, and the connection is pinned to the validated address.
+
+```env
+# Directories create_media.file_path may read from (unset = local uploads disabled)
+WORDPRESS_MEDIA_UPLOAD_DIRS=/Users/me/Pictures/wp-uploads,/srv/media
+# Size cap for local files and downloads, in bytes (default 52428800 = 50 MB)
+WORDPRESS_MEDIA_MAX_BYTES=52428800
+# Timeout for source_url downloads, in ms (default 30000)
+WORDPRESS_REQUEST_TIMEOUT_MS=30000
+# Allow source_url to reach private/loopback addresses, e.g. a local dev site (default false)
+WORDPRESS_MEDIA_ALLOW_PRIVATE_URLS=false
+```
+
 ## Response Trimming
 
 By default the server strips the top-level `yoast_head` and `yoast_head_json`
@@ -648,6 +672,20 @@ LLM almost never needs but pays tokens for on every request.
 - Only **top-level** fields are stripped; nested objects are left untouched.
 - Override the list with the `MCP_WP_STRIP_FIELDS` environment variable
   (comma-separated). Set it to an empty string to disable trimming entirely.
+
+Content reads are also projected client-side, controlled by a `fields` parameter:
+
+- `list_content` and `get_content_by_slug` return a compact summary per item by
+  default: `id`, `slug`, `type`, `status`, `date`, `modified`, `link`, `title`
+  (rendered string), `excerpt` (plain text, up to 300 characters), `author`,
+  `featured_media`, `parent`, `menu_order`, `categories`, `tags`. EventON events
+  get an event summary instead (`start_*`/`end_*`, `timezone`, `event_status`,
+  `event_type`, `tags`, `location` and `organizers` reduced to id/name/slug,
+  `repeat`, `flags`, ...), and RSVP `attendees` an attendee summary. Envelope
+  metadata like `total` and `pages` is kept.
+- `get_content` returns the full item minus `_links` and `guid`.
+- `fields: "full"` returns the untouched response; an array such as
+  `fields: ["id", "content"]` keeps only those top-level keys.
 
 ## Meta field limitations
 

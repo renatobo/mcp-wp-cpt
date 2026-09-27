@@ -4,6 +4,7 @@ export type ContractResolutionStatus =
   | 'supported'
   | 'not_contract_backed'
   | 'manifest_missing'
+  | 'manifest_disabled'
   | 'manifest_incompatible'
   | 'contract_incomplete';
 
@@ -12,6 +13,10 @@ export interface ContentTypeFieldDefinition {
   label?: string;
   description?: string;
   type?: string;
+  // Every accepted JSON type when the manifest publishes a type array.
+  types?: string[];
+  // Extra accepted input forms, e.g. `comma_separated_string` or `number`.
+  also_accepts?: string[];
   required?: boolean;
   required_on?: string[];
   write_key?: string;
@@ -60,7 +65,7 @@ export interface ProviderManifest {
 
 export interface ManifestCompatibilityIssue {
   source: string;
-  status: 'missing' | 'incompatible' | 'error';
+  status: 'missing' | 'incompatible' | 'disabled' | 'error';
   provider?: string;
   message: string;
   details?: Record<string, unknown>;
@@ -106,6 +111,10 @@ export interface PreparedContentRequest {
   fallbackOn404?: {
     endpoint: string;
     namespace?: string;
+    // Also retry a 403 carrying one of these WordPress error codes.
+    on403Codes?: string[];
+    // Replaces the request data for the fallback route.
+    data?: Record<string, unknown>;
   };
   data: Record<string, unknown>;
   warnings?: string[];

@@ -78,3 +78,48 @@ test('loadSiteManifests reports missing and incompatible manifests explicitly', 
   assert.equal(missing.issues[0]?.status, 'missing');
   assert.equal(incompatible.issues[0]?.status, 'incompatible');
 });
+
+test('loadSiteManifests normalizes type arrays and also_accepts on field definitions', async () => {
+  clearManifestCache();
+
+  const result = await loadSiteManifests('site-c', true, {
+    request: async () => ({
+      schema_version: '1.0.0',
+      provider: 'eventon-apify',
+      content_types: [{
+        slug: 'ajde_events',
+        preferred_endpoint: 'eventonapify/v1/events',
+        fields: [
+          { name: 'location', type: 'object', shape: [{ name: 'lat', type: ['string', 'number'] }] },
+          { name: 'tags', type: 'array', also_accepts: ['comma_separated_string'], items: { type: 'string' } }
+        ]
+      }]
+    }),
+    resolveSiteId: (siteId) => siteId || 'site-c'
+  });
+
+  const [location, tags] = result.manifests[0].contentTypes[0].fields!;
+  assert.equal(location.shape?.[0].type, 'string');
+  assert.deepEqual(location.shape?.[0].types, ['string', 'number']);
+  assert.deepEqual(tags.also_accepts, ['comma_separated_string']);
+  // A single string type is not repeated as a one-entry `types` list.
+  assert.equal(location.types, undefined);
+  assert.equal(tags.types, undefined);
+});
+
+test('loadSiteManifests reports a disabled APIfy API distinctly', async () => {
+  clearManifestCache();
+
+  const disabled = await loadSiteManifests('site-d', true, {
+    request: async () => {
+      throw {
+        isAxiosError: true,
+        response: { status: 403, data: { code: 'eventon_apify_capability_disabled' } }
+      };
+    },
+    resolveSiteId: (siteId) => siteId || 'site-d'
+  });
+
+  assert.equal(disabled.issues[0]?.status, 'disabled');
+  assert.match(disabled.issues[0]?.message, /API is disabled/);
+});

@@ -234,3 +234,82 @@ test('contract interpreter returns actionable validation errors', () => {
     }
   );
 });
+
+const eventContext = (contractOverride: ContentTypeContract, operation: 'create' | 'update' = 'create') => ({
+  siteId: 'default',
+  contentType: 'ajde_events',
+  operation,
+  manifest,
+  contract: contractOverride
+});
+
+const timingContract = (validation_rules: Record<string, unknown>, extraFields: ContentTypeContract['fields'] = []): ContentTypeContract => ({
+  slug: 'ajde_events',
+  preferred_endpoint: 'eventonapify/v1/events',
+  preferred_write_mode: 'fields',
+  fields: [
+    { name: 'start_at', type: 'string' },
+    { name: 'start_date', type: 'date' },
+    { name: 'end_time', type: 'time' },
+    ...(extraFields || [])
+  ],
+  validation_rules
+});
+
+test('one_of_required_for_create applies on create only', () => {
+  const oneOf = timingContract({ required_for_create: ['title'], one_of_required_for_create: [['start_date', 'start_at']] });
+
+  assert.doesNotThrow(() => prepareContractWriteRequest({ title: 'A', fields: { start_at: '2026-01-01T10:00:00Z' } }, eventContext(oneOf)));
+  assert.doesNotThrow(() => prepareContractWriteRequest({ title: 'A', fields: { start_date: '2026-01-01' } }, eventContext(oneOf)));
+  assert.throws(
+    () => prepareContractWriteRequest({ title: 'A', fields: { end_time: '10:00' } }, eventContext(oneOf)),
+    (error: unknown) => {
+      assert.ok(error instanceof ContractValidationError);
+      assert.ok(error.validationIssues.some((entry) => /At least one of `fields.start_date`, `fields.start_at`/.test(entry)));
+      return true;
+    }
+  );
+  assert.doesNotThrow(() => prepareContractWriteRequest({ fields: { end_time: '10:00' } }, eventContext(oneOf, 'update')));
+});
+
+test('a legacy required start_date is satisfied by start_at', () => {
+  const legacy = timingContract({ required_for_create: ['title', 'start_date'] });
+  legacy.fields = legacy.fields!.map((field) => field.name === 'start_date' ? { ...field, required_on: ['create'] } : field);
+
+  const prepared = prepareContractWriteRequest({ title: 'A', fields: { start_at: '2026-01-01T10:00:00Z' } }, eventContext(legacy));
+  assert.equal(prepared.data.start_at, '2026-01-01T10:00:00Z');
+  assert.throws(() => prepareContractWriteRequest({ title: 'A', fields: {} }, eventContext(legacy)), ContractValidationError);
+});
+
+test('type arrays, numeric hints, and comma-separated strings are accepted', () => {
+  const flexible = timingContract({}, [
+    {
+      name: 'location',
+      type: 'object',
+      shape: [
+        { name: 'lat', type: 'string', types: ['string', 'number'] },
+        { name: 'lon', type: 'string', also_accepts: ['number'] },
+        { name: 'name', type: 'string' }
+      ]
+    },
+    { name: 'tags', type: 'array', also_accepts: ['comma_separated_string'], items: { name: 'tag', type: 'string' } },
+    { name: 'event_type', type: 'array', items: { name: 'event_type', type: 'string' } }
+  ]);
+
+  const prepared = prepareContractWriteRequest(
+    { title: 'A', fields: { location: { lat: 34.1, lon: -117.2, name: 'X' }, tags: ' a, b ,, c ' } },
+    eventContext(flexible)
+  );
+  assert.deepEqual(prepared.data.location, { lat: 34.1, lon: -117.2, name: 'X' });
+  assert.deepEqual(prepared.data.tags, ['a', 'b', 'c']);
+
+  assert.throws(
+    () => prepareContractWriteRequest({ title: 'A', fields: { location: { name: 5 }, event_type: 'x' } }, eventContext(flexible)),
+    (error: unknown) => {
+      assert.ok(error instanceof ContractValidationError);
+      assert.ok(error.validationIssues.includes('`fields.location.name` must be a string.'));
+      assert.ok(error.validationIssues.includes('`fields.event_type` must be an array.'));
+      return true;
+    }
+  );
+});

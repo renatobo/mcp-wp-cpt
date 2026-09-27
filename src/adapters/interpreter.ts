@@ -60,7 +60,8 @@ export function assessContractExecutionSupport(contract: ContentTypeContract): C
 
 export function prepareContractWriteRequest(
   input: AdaptedWriteInput,
-  context: ContractInterpreterContext
+  context: ContractInterpreterContext,
+  fallbackEndpoint: string = getContentEndpoint(context.contentType)
 ): PreparedContentRequest {
   const payload = buildBaseContentPayload(input, context.operation);
   const writeMode = context.contract.preferred_write_mode || 'fields';
@@ -85,7 +86,7 @@ export function prepareContractWriteRequest(
 
   const endpointInfo = splitNamespacedEndpoint(
     context.contract.preferred_endpoint,
-    getContentEndpoint(context.contentType)
+    fallbackEndpoint
   );
   const preferredWrite = getPreferredWriteEndpoint({
     contentType: context.contentType,
@@ -158,16 +159,14 @@ function validateStructuredFields(
 
   const requiredKeys = resolveRequiredKeys(fieldDefinitions, context.operation);
   for (const key of requiredKeys) {
-    const definition = fieldMap.get(key);
-    const value = definition ? readFieldValue(fields, definition) : undefined;
-    if (value === undefined) {
+    if (!isRequiredKeySatisfied(key, fields, input, fieldMap)) {
       issues.push(`\`fields.${key}\` is required for ${context.operation}.`);
     }
   }
 
   const requiredByRule = getStringArray(validationRules, `required_for_${context.operation}`);
   for (const key of requiredByRule) {
-    if (readContractValueByKey(fields, input, fieldMap, key) === undefined) {
+    if (!isRequiredKeySatisfied(key, fields, input, fieldMap)) {
       const path = fieldMap.has(key) ? `fields.${key}` : key;
       issues.push(`\`${path}\` is required for ${context.operation}.`);
     }
@@ -180,10 +179,16 @@ function validateStructuredFields(
     }
   }
 
-  for (const group of getGroupRules(validationRules, 'one_of_required')) {
-    const presentCount = group.filter((key) => readFieldValueByKey(fields, fieldMap, key) !== undefined).length;
+  // `one_of_required` applies to every operation; `one_of_required_for_<op>`
+  // (e.g. one_of_required_for_create: [["start_date", "start_at"]]) to one.
+  const oneOfGroups = [
+    ...getGroupRules(validationRules, 'one_of_required'),
+    ...getGroupRules(validationRules, `one_of_required_for_${context.operation}`)
+  ];
+  for (const group of oneOfGroups) {
+    const presentCount = group.filter((key) => readContractValueByKey(fields, input, fieldMap, key) !== undefined).length;
     if (presentCount === 0) {
-      issues.push(`At least one of ${group.map((key) => `\`fields.${key}\``).join(', ')} is required.`);
+      issues.push(`At least one of ${group.map((key) => fieldMap.has(key) ? `\`fields.${key}\`` : `\`${key}\``).join(', ')} is required for ${context.operation}.`);
     }
   }
 
@@ -244,11 +249,97 @@ function normalizeValueByShape(value: unknown, definition: ContentTypeFieldDefin
     return nested;
   }
 
+  if (definition.type === 'array' && typeof value === 'string' && acceptsCommaSeparatedString(definition)) {
+    return splitCommaSeparated(value);
+  }
+
   if (definition.type === 'array' && Array.isArray(value) && definition.items) {
-    return value.map((entry) => normalizeFieldValue(entry, definition.items!));
+    const itemDefinition = definition.items;
+    return value.map((entry) => {
+      // Array items keep keys their shape does not declare: the provider
+      // validates each item and may accept more input forms (e.g. EventON
+      // repeat intervals as start_timestamp/end_timestamp or [start, end]).
+      const normalized = normalizeFieldValue(entry, itemDefinition);
+      return isPlainObject(entry) && isPlainObject(normalized)
+        ? { ...pickUndeclaredKeys(entry, itemDefinition), ...normalized }
+        : normalized;
+    });
   }
 
   return value;
+}
+
+function pickUndeclaredKeys(
+  value: Record<string, unknown>,
+  definition: ContentTypeFieldDefinition
+): Record<string, unknown> {
+  const declared = new Set<string>();
+  for (const childDefinition of definition.shape || []) {
+    declared.add(childDefinition.name);
+    for (const alias of childDefinition.aliases || []) {
+      declared.add(alias);
+    }
+  }
+
+  const undeclared: Record<string, unknown> = {};
+  for (const [key, entry] of Object.entries(value)) {
+    if (!declared.has(key) && entry !== undefined) {
+      undeclared[key] = entry;
+    }
+  }
+  return undeclared;
+}
+
+function acceptsCommaSeparatedString(definition: ContentTypeFieldDefinition): boolean {
+  return Boolean(definition.also_accepts?.includes('comma_separated_string'));
+}
+
+function splitCommaSeparated(value: string): string[] {
+  return value
+    .split(',')
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0);
+}
+
+// Every JSON type a field accepts: the published type (or type array) plus
+// `also_accepts` / `accepts_numeric` hints for numeric input.
+function getAcceptedTypes(definition: ContentTypeFieldDefinition): Set<string> {
+  const accepted = new Set<string>(definition.types && definition.types.length > 0 ? definition.types : definition.type ? [definition.type] : []);
+
+  for (const hint of definition.also_accepts || []) {
+    if (hint === 'number' || hint === 'numeric' || hint === 'integer' || hint === 'numeric_string') {
+      accepted.add('number');
+    } else if (hint === 'string' || hint === 'boolean' || hint === 'object' || hint === 'array') {
+      accepted.add(hint);
+    }
+  }
+
+  if (definition.accepts_numeric === true) {
+    accepted.add('number');
+  }
+
+  return accepted;
+}
+
+function matchesJsonType(value: unknown, type: string): boolean {
+  switch (type) {
+    case 'string':
+    case 'date':
+    case 'time':
+      return typeof value === 'string';
+    case 'number':
+      return typeof value === 'number' && Number.isFinite(value);
+    case 'integer':
+      return typeof value === 'number' && Number.isInteger(value);
+    case 'boolean':
+      return typeof value === 'boolean';
+    case 'object':
+      return isPlainObject(value);
+    case 'array':
+      return Array.isArray(value);
+    default:
+      return true;
+  }
 }
 
 function applyCoercion(
@@ -308,6 +399,40 @@ function validateValueAgainstDefinition(
     issues.push(`\`${path}\` must be one of: ${definition.enum.map((entry) => JSON.stringify(entry)).join(', ')}.`);
   }
 
+  const typeIssues = validateValueType(value, definition, path);
+  if (typeIssues.length > 0 && definition.coerce) {
+    // A shorthand the contract declares a coercion for (e.g. a timezone string
+    // for a `string_to_object` object) is valid when its coerced form is.
+    const coerced = applyCoercion(value, definition.coerce, definition);
+    if (coerced !== value && validateValueType(coerced, definition, path).length === 0) {
+      return issues;
+    }
+  }
+
+  return [...issues, ...typeIssues];
+}
+
+function validateValueType(
+  value: unknown,
+  definition: ContentTypeFieldDefinition,
+  path: string
+): string[] {
+  const issues: string[] = [];
+
+  const acceptedTypes = getAcceptedTypes(definition);
+  if (acceptedTypes.size > 1) {
+    // Multi-type fields (type arrays or also_accepts hints): accept any listed
+    // JSON type, then validate structure only for the primary object/array form.
+    const commaString = definition.type === 'array' && typeof value === 'string' && acceptsCommaSeparatedString(definition);
+    if (!commaString && !Array.from(acceptedTypes).some((type) => matchesJsonType(value, type))) {
+      issues.push(`\`${path}\` must be ${describeTypes(acceptedTypes)}.`);
+      return issues;
+    }
+    if (!matchesJsonType(value, definition.type || '')) {
+      return issues;
+    }
+  }
+
   if (definition.type) {
     switch (definition.type) {
       case 'string':
@@ -346,11 +471,20 @@ function validateValueAgainstDefinition(
         }
         break;
       case 'array':
+        if (typeof value === 'string' && acceptsCommaSeparatedString(definition)) {
+          break;
+        }
         if (!Array.isArray(value)) {
           issues.push(`\`${path}\` must be an array.`);
         } else if (definition.items) {
+          const itemDefinition = definition.items;
           value.forEach((entry, index) => {
-            issues.push(...validateValueAgainstDefinition(entry, definition.items!, `${path}[${index}]`));
+            // Tuple forms of object items (e.g. a [start, end] timestamp pair)
+            // cannot be expressed as a shape; the provider validates them.
+            if (itemDefinition.type === 'object' && Array.isArray(entry)) {
+              return;
+            }
+            issues.push(...validateValueAgainstDefinition(entry, itemDefinition, `${path}[${index}]`));
           });
         }
         break;
@@ -360,6 +494,40 @@ function validateValueAgainstDefinition(
   }
 
   return issues;
+}
+
+// Date parts that an ISO 8601 datetime field can stand in for. Older manifests
+// (EventON APIfy 3.5.1) mark start_date required on create even though the
+// plugin also accepts start_at and splits it; when the contract defines the
+// datetime field, supplying it satisfies the date requirement.
+const DATETIME_ALTERNATIVES: Record<string, string> = {
+  start_date: 'start_at',
+  end_date: 'end_at'
+};
+
+function isRequiredKeySatisfied(
+  key: string,
+  fields: Record<string, unknown>,
+  input: AdaptedWriteInput,
+  fieldMap: Map<string, ContentTypeFieldDefinition>
+): boolean {
+  if (readContractValueByKey(fields, input, fieldMap, key) !== undefined) {
+    return true;
+  }
+
+  const alternative = DATETIME_ALTERNATIVES[key];
+  return Boolean(
+    alternative &&
+      fieldMap.has(alternative) &&
+      readFieldValueByKey(fields, fieldMap, alternative) !== undefined
+  );
+}
+
+function describeTypes(types: Set<string>): string {
+  const labels = Array.from(types).map((type) =>
+    type === 'object' || type === 'array' || type === 'integer' ? `an ${type}` : `a ${type === 'date' || type === 'time' ? 'string' : type}`
+  );
+  return labels.length > 1 ? `${labels.slice(0, -1).join(', ')} or ${labels[labels.length - 1]}` : labels[0] || 'valid';
 }
 
 function resolveRequiredKeys(

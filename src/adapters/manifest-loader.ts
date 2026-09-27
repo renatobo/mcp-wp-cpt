@@ -1,6 +1,7 @@
 import axios from 'axios';
 import { siteManager } from '../config/site-manager.js';
 import { makeWordPressRequest, logToFile } from '../wordpress.js';
+import { EVENTON_API_DISABLED_ERROR_CODES } from '../content/utils.js';
 import {
   ContentTypeContract,
   ContentTypeFieldDefinition,
@@ -182,13 +183,28 @@ function normalizeFields(value: unknown): ContentTypeFieldDefinition[] | undefin
   return fields.length > 0 ? fields : undefined;
 }
 
-function buildManifestIssue(source: ManifestDiscoverySource, error: any): ManifestCompatibilityIssue {
+export function buildManifestIssue(source: ManifestDiscoverySource, error: any): ManifestCompatibilityIssue {
+  // A missing plugin namespace surfaces as a 404, either from the manifest route
+  // itself or from the namespace probe run when the client is created.
   if (axios.isAxiosError(error) && error.response?.status === 404) {
     return {
       source: `${source.namespace}/${source.endpoint}`,
       provider: source.provider,
       status: 'missing',
       message: `Manifest endpoint ${source.namespace}/${source.endpoint} is not available on this site`
+    };
+  }
+
+  const errorCode = typeof error?.response?.data?.code === 'string' ? error.response.data.code : undefined;
+  if (axios.isAxiosError(error) && error.response?.status === 403 && errorCode && EVENTON_API_DISABLED_ERROR_CODES.includes(errorCode)) {
+    const pluginMessage = typeof error.response?.data?.message === 'string' ? ` (${error.response.data.message})` : '';
+    return {
+      source: `${source.namespace}/${source.endpoint}`,
+      provider: source.provider,
+      status: 'disabled',
+      message: `The ${source.provider} API is disabled on this site${pluginMessage}. ` +
+        'Structured contract writes are unavailable until it is enabled; reads fall back to native wp/v2 routes where possible.',
+      details: { code: errorCode }
     };
   }
 
@@ -270,13 +286,21 @@ function normalizeFieldDefinition(
 
   const shape = normalizeFieldCollection(raw.shape ?? raw.properties ?? raw.fields);
   const items = normalizeArrayItemDefinition(raw.items);
+  // JSON-Schema style type arrays (e.g. ["string", "number"]) keep every entry
+  // in `types`; `type` stays the primary (first non-null) entry for shape logic.
+  // Only an explicit array gets `types`, so single-type fields don't repeat themselves.
+  const types = Array.isArray(raw.type)
+    ? normalizeStringArray(raw.type)?.filter((entry) => entry !== 'null')
+    : undefined;
 
   return {
     ...raw,
     name,
     label: coerceString(raw.label) || coerceString(raw.name),
     description: coerceString(raw.description),
-    type: coerceString(raw.type),
+    type: coerceString(raw.type) || types?.[0],
+    types: types && types.length > 0 ? types : undefined,
+    also_accepts: normalizeStringArray(raw.also_accepts),
     required: typeof raw.required === 'boolean' ? raw.required : undefined,
     required_on: normalizeStringArray(raw.required_on),
     write_key:

@@ -7,6 +7,13 @@ import {
   ProviderManifest
 } from './types.js';
 
+const RESOLUTION_STATUS_BY_ISSUE = {
+  missing: 'manifest_missing',
+  incompatible: 'manifest_incompatible',
+  disabled: 'manifest_disabled',
+  error: 'not_contract_backed'
+} as const;
+
 export async function resolveContentTypeContract(
   contentType: string,
   siteId?: string,
@@ -47,14 +54,14 @@ export async function resolveContentTypeContract(
   }
 
   const missingOrIncompatibleIssue = manifestResult.issues.find((issue) =>
-    issue.status === 'missing' || issue.status === 'incompatible'
+    issue.status === 'missing' || issue.status === 'incompatible' || issue.status === 'disabled'
   );
 
   if (missingOrIncompatibleIssue) {
     return {
       siteId: resolvedSiteId,
       contentType,
-      status: missingOrIncompatibleIssue.status === 'missing' ? 'manifest_missing' : 'manifest_incompatible',
+      status: RESOLUTION_STATUS_BY_ISSUE[missingOrIncompatibleIssue.status],
       issues: manifestResult.issues,
       executionSupport: {
         executable: false,

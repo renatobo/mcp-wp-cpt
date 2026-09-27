@@ -73,3 +73,25 @@ export const applyContentEdit = (existingContent: string, edit: ContentEditParam
 
   return `${existingContent.slice(0, targetIndex)}${edit.value}${existingContent.slice(targetEnd)}`;
 };
+
+// Operations that splice the value into the middle of existing markup. A value
+// converted to a block-level element (e.g. markdown -> `<p>...</p>`) would nest
+// paragraphs here, so inline targets get the wrapper stripped.
+const INLINE_SPLICE_OPERATIONS = new Set<ContentEditOperation>(['insert_before', 'insert_after', 'replace']);
+
+const BLOCK_LEVEL_MARKUP = /<!--\s*wp:|<\/?(p|div|h[1-6]|ul|ol|li|blockquote|pre|table|figure|section|article|header|footer|hr)\b/i;
+
+// True when the edit splices into running text rather than around whole blocks.
+export const isInlineContentEditTarget = (edit: ContentEditParams): boolean =>
+  INLINE_SPLICE_OPERATIONS.has(edit.operation) &&
+  typeof edit.target_text === 'string' &&
+  !BLOCK_LEVEL_MARKUP.test(edit.target_text);
+
+// Strip exactly one `<p>...</p>` wrapper when it encloses the whole fragment.
+export const stripSingleWrappingParagraph = (html: string): string => {
+  const match = /^\s*<p>([\s\S]*)<\/p>\s*$/.exec(html);
+  if (!match || /<\/?p[\s>]/i.test(match[1])) {
+    return html;
+  }
+  return match[1];
+};
