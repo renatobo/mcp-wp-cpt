@@ -8,33 +8,6 @@ import { userAgentHeader } from './config/user-agent.js';
 let wpClient: AxiosInstance | undefined;
 
 const DEFAULT_STRIP_FIELDS = ['yoast_head', 'yoast_head_json'];
-const SENSITIVE_LOG_KEYS = /^(authorization|proxy-authorization|cookie|set-cookie|password|passwd|token|access_token|refresh_token|secret|api[_-]?key)$/i;
-const REDACTED_VALUE = '[REDACTED]';
-
-export function redactSensitiveLogData(value: unknown, seen = new WeakSet<object>()): unknown {
-  if (Array.isArray(value)) {
-    return value.map((item) => redactSensitiveLogData(item, seen));
-  }
-
-  if (!value || typeof value !== 'object') {
-    return value;
-  }
-
-  if (seen.has(value)) {
-    return '[CIRCULAR]';
-  }
-  seen.add(value);
-
-  const redacted: Record<string, unknown> = {};
-  for (const [key, nestedValue] of Object.entries(value as Record<string, unknown>)) {
-    redacted[key] = SENSITIVE_LOG_KEYS.test(key)
-      ? REDACTED_VALUE
-      : redactSensitiveLogData(nestedValue, seen);
-  }
-
-  return redacted;
-}
-
 /**
  * Resolve the list of top-level fields to strip from WP REST responses.
  * Reads MCP_WP_STRIP_FIELDS (comma-separated) and falls back to the default list.
@@ -82,6 +55,100 @@ export async function initWordPress() {
   const client = await siteManager.getClient();
   wpClient = client;
   logToFile('WordPress client initialized successfully via SiteManager', 'info');
+}
+
+// Header names whose value authenticates the request. `Authorization` carries
+// `Basic base64(user:app-password)`, which is reversible with one command — so
+// logging it verbatim logs the WordPress application password in the clear.
+// logToFile writes to stderr (despite the name); for a stdio MCP server the host
+// client captures stderr into its own log files, so a debug run leaves the
+// credential sitting in the client's logs. Reported privately by Syed Anas
+// Mohiuddin.
+const REDACTED_HEADERS = new Set([
+  'authorization',
+  'proxy-authorization',
+  'cookie',
+  'set-cookie',
+  'x-api-key',
+  'x-auth-token'
+]);
+
+/**
+ * Replace the value of every credential-bearing header with a placeholder.
+ *
+ * Case-insensitive, because axios merges headers from several sources and does
+ * not normalize their case. Nested bags are walked too: `defaults.headers` also
+ * carries per-method sub-objects (`common`, `post`, …), and a header set there
+ * would otherwise be logged verbatim inside its parent.
+ */
+export function redactHeaders(headers: Record<string, any> | undefined, depth = 0): Record<string, any> {
+  // Bounded for the same reason redactData is: a cyclic bag would otherwise
+  // recurse until the stack gives out.
+  if (depth > 6) return {};
+  const safe: Record<string, any> = {};
+  for (const [name, value] of Object.entries(headers || {})) {
+    if (REDACTED_HEADERS.has(name.toLowerCase())) {
+      safe[name] = '[REDACTED]';
+    } else if (value && typeof value === 'object' && !Array.isArray(value)) {
+      safe[name] = redactHeaders(value as Record<string, any>, depth + 1);
+    } else {
+      safe[name] = value;
+    }
+  }
+  return safe;
+}
+
+// Request-body keys whose value is a credential. `create_user` and `update_user`
+// pass their params straight through, so a `debug` run logged a WordPress user's
+// password in cleartext one line below the header bag this PR redacts — the same
+// exposure, through the other half of the same log statement.
+// Matched as a SUBSTRING, not as the whole key. An exact list has to guess every
+// name a credential might arrive under and misses the ones that matter:
+// `user_pass` is WordPress's own column, and `update_content` forwards arbitrary
+// `meta`/`custom_fields` straight into the logged body, where a plugin's
+// `smtp_password` is an ordinary key. Over-redacting a debug log costs nothing.
+const REDACTED_KEYS =
+  /(pass|pwd|secret|token|nonce|jwt|bearer|credential|cookie|signature|auth|(?:api|access|private|consumer|license|encryption)[_-]?key)/i;
+
+// `auth` as a substring also catches WordPress's author fields, which are
+// declared parameters on the content and comment tools — redacting those blinds
+// the log for exactly the debugging it exists to serve. Listed explicitly rather
+// than carved out of the pattern, so that `authorization` keeps matching.
+const NEVER_REDACTED_KEYS = /^author(_(name|email|url|exclude|ip|user_agent))?$/i;
+
+/**
+ * Replace the value of every credential-bearing key with a placeholder, walking
+ * plain objects and arrays.
+ *
+ * Only plain objects are walked: anything else (a Date, a Buffer, a stream) is
+ * returned untouched, because `Object.entries` on those loses the value —
+ * a Date would log as `{}` and a Buffer as a map of byte offsets.
+ */
+// Kept for existing callers: the same redaction as redactData.
+export function redactSensitiveLogData(value: unknown): unknown {
+  return redactData(value);
+}
+
+export function redactData(value: any, depth = 0): any {
+  if (value === null || typeof value !== 'object') return value;
+
+  const isPlain = Array.isArray(value)
+    || Object.getPrototypeOf(value) === Object.prototype
+    || Object.getPrototypeOf(value) === null;
+  if (!isPlain) return value;
+
+  // A subtree deeper than this is replaced rather than returned raw, so the cap
+  // cannot become a way to smuggle a credential past the redaction.
+  if (depth > 6) return '[TRUNCATED]';
+
+  if (Array.isArray(value)) return value.map((v) => redactData(v, depth + 1));
+
+  const safe: Record<string, any> = {};
+  for (const [key, v] of Object.entries(value)) {
+    const redact = REDACTED_KEYS.test(key) && !NEVER_REDACTED_KEYS.test(key);
+    safe[key] = redact ? '[REDACTED]' : redactData(v, depth + 1);
+  }
+  return safe;
 }
 
 export function logToFile(message: string, level: 'debug' | 'info' | 'error' = 'debug') {
@@ -196,7 +263,7 @@ export async function makeWordPressRequest(
 
   // Log data (skip for FormData which can't be stringified)
   if (!options?.isFormData) {
-    logToFile(`Data: ${JSON.stringify(redactSensitiveLogData(data), null, 2)}`, 'debug');
+    logToFile(`Data: ${JSON.stringify(redactData(data), null, 2)}`, 'debug');
   } else {
     logToFile('Request contains FormData (not shown in logs)', 'debug');
   }
@@ -234,16 +301,14 @@ export async function makeWordPressRequest(
       requestConfig.data = data;
     }
     
-    const redactedHeaders = redactSensitiveLogData({ ...client.defaults.headers, ...requestConfig.headers });
-    const redactedData = redactSensitiveLogData(data);
     const requestLog = `
 REQUEST:
 URL: ${fullUrl}
 Method: ${method}
 Site: ${options?.siteId || 'default'}
 Namespace: ${namespace}
-Headers: ${JSON.stringify(redactedHeaders, null, 2)}
-Data: ${options?.isFormData ? '(FormData not shown)' : JSON.stringify(redactedData, null, 2)}
+Headers: ${JSON.stringify(redactHeaders({...client.defaults.headers, ...requestConfig.headers}), null, 2)}
+Data: ${options?.isFormData ? '(FormData not shown)' : JSON.stringify(redactData(data), null, 2)}
 `;
     logToFile(requestLog, 'debug');
 
@@ -252,7 +317,7 @@ Data: ${options?.isFormData ? '(FormData not shown)' : JSON.stringify(redactedDa
     const responseLog = `
 RESPONSE:
 Status: ${response.status}
-Data: ${JSON.stringify(redactSensitiveLogData(response.data), null, 2)}
+Data: ${JSON.stringify(redactData(response.data), null, 2)}
 `;
     logToFile(responseLog, 'debug');
 
@@ -279,7 +344,7 @@ Data: ${JSON.stringify(redactSensitiveLogData(response.data), null, 2)}
 ERROR:
 Message: ${error.message}
 Status: ${error.response?.status || 'N/A'}
-Data: ${JSON.stringify(redactSensitiveLogData(error.response?.data || {}), null, 2)}
+Data: ${JSON.stringify(redactData(error.response?.data || {}), null, 2)}
 `;
     logToFile(errorLog, 'error');
     throw error;
