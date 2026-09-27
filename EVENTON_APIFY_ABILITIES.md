@@ -1,6 +1,6 @@
 # EventON APIfy WordPress abilities
 
-EventON APIfy 3.5.0 (released 2026-09-26, requires WordPress 7.1) registers three read-only WordPress abilities. This server does not use them yet: it reads EventON through the plugin's `mcp-schema` manifest and writes through `wp/v2` (see [PLUGIN_CONTRACT_REQUIREMENTS.md](PLUGIN_CONTRACT_REQUIREMENTS.md)). This note records what the abilities offer and what adopting them would involve. Nothing here is implemented in this repo.
+EventON APIfy 3.5.0+ (3.5.0 released 2026-09-26; requires WordPress 7.1) registers three read-only WordPress abilities. This server does not use them yet: it discovers the contract from the plugin's `mcp-schema` manifest and reads and writes events through `eventonapify/v1/events`. When the manifest resolves, structured `ajde_events` writes go to `eventonapify/v1/events`; only the no-manifest fallback writes through `wp/v2/ajde_events` (see [PLUGIN_CONTRACT_REQUIREMENTS.md](PLUGIN_CONTRACT_REQUIREMENTS.md)). This note records what the abilities offer and what adopting them would involve. Nothing here is implemented in this repo.
 
 Source of truth: `eventon-apify/includes/abilities.php` and the "WordPress abilities" section of the eventon-apify README.
 
@@ -12,7 +12,7 @@ Source of truth: `eventon-apify/includes/abilities.php` and the "WordPress abili
 | `eventon-apify/search-events` | `search` (≤200 chars), `page` (≥1), `per_page` (1-100), `status` (array of `publish`, `draft`, `private`, `pending`, `future`), `starts_on_or_after`, `starts_before` (date or ISO 8601), `upcoming` (bool), `order` (`asc`/`desc`), `orderby` (`start_at`, `created`, `modified`, `title`). No other keys allowed. | `total`, `pages`, `page`, `per_page`, optional `truncated: true`, and `events[]` summaries: `id`, `title`, `slug`, `status`, `link`, `start_at`, `end_at`, `timezone` (IANA id), `event_status`, `attendance_mode`, `location_name`, `event_type` (labels). |
 | `eventon-apify/get-event` | `id` (integer ≥1, required) | One event in the `eventonapify/v1` event shape, with location/organizer email, phone, and address, virtual access secrets (URL, password, embed), and RSVP notification emails removed. |
 
-All three are in the `eventon-apify` category and annotated `readonly: true, destructive: false, idempotent: true`. There are no write abilities; writes stay on `wp/v2` (and `eventonapify/v1`).
+All three are in the `eventon-apify` category and annotated `readonly: true, destructive: false, idempotent: true`. There are no write abilities; writes stay on `eventonapify/v1` (and `wp/v2` for the no-manifest fallback).
 
 ## Calling them over REST
 
@@ -33,13 +33,13 @@ Core exposes abilities under `/wp-json/wp-abilities/v1`. Use the same Applicatio
 
 Possible uses, roughly in order of value:
 
-1. **Health check before EventON operations.** `get-status` answers "is EventON active, is the API on, which operations are allowed" in one call without touching event data. Today the server infers this from the manifest's availability flags. This would give clearer errors when a site has the API or a toggle switched off.
+1. **Health check before EventON operations.** `get-status` answers "is EventON active, is the API on, which operations are allowed" in one call without touching event data. Today the server does not read the manifest's `availability` block; it infers availability from request failures (a 404 on the namespace means APIfy is missing, a 403 `eventon_apify_disabled` / `eventon_apify_capability_disabled` means the API or a toggle is off, and reads then fall back to `wp/v2`). This would give clearer errors before the first failing call.
 2. **Event lookup.** `search-events` returns compact summaries with correct timezone offsets (EventON stores wall-clock time as UTC; the plugin converts it), which is cheaper for an LLM than full `wp/v2` event payloads.
 3. **Generic ability tools.** A generic "list abilities / run ability" pair of tools would cover these three and any other plugin's abilities, using the published schemas as tool input schemas. That fits this repo's contract-driven approach better than EventON-specific tools.
 
 Things to keep:
 
-- Keep the manifest path and the `wp/v2` write path. The abilities are read-only and do not replace the contract interpreter; the manifest's field vocabulary (`write_key`, `aliases`, `required_on`, `shape`) is not JSON Schema and is not published as abilities.
+- Keep the manifest path and the `eventonapify/v1` write path (with its `wp/v2` no-manifest fallback). The abilities are read-only and do not replace the contract interpreter; the manifest's field vocabulary (`write_key`, `aliases`, `required_on`, `shape`) is not JSON Schema and is not published as abilities.
 - Feature-detect: a site on EventON APIfy < 3.5.0 or WordPress < 7.1 has no abilities. Fall back to the current behavior when `wp-abilities/v1` is absent or the list contains no `eventon-apify/*` entries.
 - `get-event` output is redacted. Do not rely on it for contact fields the manifest-driven read currently returns to administrators.
 

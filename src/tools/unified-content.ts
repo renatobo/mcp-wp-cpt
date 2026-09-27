@@ -2,15 +2,14 @@
 import { Tool } from '@modelcontextprotocol/sdk/types.js';
 import { makeWordPressRequest, logToFile } from '../wordpress.js';
 import { z } from 'zod';
-import * as fs from 'fs-extra';
-import * as path from 'path';
-import * as os from 'os';
 import { marked } from 'marked';
 import {
   applyContentEdit,
   CONTENT_EDIT_OPERATIONS,
   ContentEditOperation,
   ContentEditParams,
+  isInlineContentEditTarget,
+  stripSingleWrappingParagraph,
   validateContentEdit
 } from '../content/content-edit.js';
 
@@ -27,84 +26,28 @@ import {
 } from '../content/write-preparation.js';
 import { extractContentCollection, findItemBySlug } from '../content/utils.js';
 import { prepareGetContentRequest, prepareListContentRequest } from '../content/read-preparation.js';
+import { getSiteTypes } from '../content/content-types.js';
 import { ContractCompatibilityError, ContractValidationError } from '../adapters/types.js';
-import { assertEventONWritePersistence } from '../content/eventon-write-verification.js';
+import {
+  ContentFieldsSelection,
+  projectContentItem,
+  projectListItem,
+  projectListResponse
+} from '../content/projection.js';
+import {
+  assertEventONWritePersistence,
+  EventONWriteUnverifiedError,
+  hasEventONVerifiableInput,
+  isFullEventONEvent,
+  formatEventONWriteUnverifiedError
+} from '../content/eventon-write-verification.js';
 
-const CACHE_DIR = process.env.UNIFIED_CONTENT_CACHE_DIR
-  ? path.resolve(process.env.UNIFIED_CONTENT_CACHE_DIR)
-  : path.join(os.tmpdir(), 'mcp-wp', '.cache');
-
-fs.ensureDir(CACHE_DIR).catch(() => {});
-
-// Cache for post types to reduce API calls
-const postTypesCache = new Map<string, { value: any; timestamp: number }>();
 const CACHE_DURATION = parseInt(process.env.WORDPRESS_CACHE_DURATION || `${5 * 60 * 1000}`, 10);
 const rankMathActiveCache = new Map<string, { value: boolean; timestamp: number }>();
 
-async function loadCacheFromDisk(siteId: string): Promise<{ data: any; timestamp: number } | null> {
-  try {
-    await fs.ensureDir(CACHE_DIR);
-    const cacheFilePath = path.join(CACHE_DIR, `content-types-${siteId}.json`);
-
-    if (await fs.pathExists(cacheFilePath)) {
-      return await fs.readJson(cacheFilePath);
-    }
-  } catch (error) {
-    logToFile(`Failed to load content type cache from disk: ${error}`, 'debug');
-  }
-
-  return null;
-}
-
-async function saveCacheToDisk(siteId: string, data: any): Promise<void> {
-  try {
-    await fs.ensureDir(CACHE_DIR);
-    const cacheFilePath = path.join(CACHE_DIR, `content-types-${siteId}.json`);
-    await fs.writeJson(cacheFilePath, {
-      data,
-      timestamp: Date.now()
-    });
-  } catch (error) {
-    logToFile(`Failed to save content type cache to disk: ${error}`, 'debug');
-  }
-}
-
-// Helper function to get all post types with caching
+// /types lookups share the per-site cache in src/content/content-types.ts.
 async function getPostTypes(forceRefresh = false, siteId?: string) {
-  const now = Date.now();
-  const resolvedSiteId = siteManager.resolveSiteId(siteId);
-  const cacheEntry = postTypesCache.get(resolvedSiteId);
-
-  if (!forceRefresh && cacheEntry && (now - cacheEntry.timestamp) < CACHE_DURATION) {
-    logToFile('Using memory-cached post types', 'debug');
-    return cacheEntry.value;
-  }
-
-  if (!forceRefresh) {
-    const diskCache = await loadCacheFromDisk(resolvedSiteId);
-    if (diskCache && (now - diskCache.timestamp) < CACHE_DURATION) {
-      logToFile('Using disk-cached post types', 'debug');
-      postTypesCache.set(resolvedSiteId, {
-        value: diskCache.data,
-        timestamp: diskCache.timestamp
-      });
-      return diskCache.data;
-    }
-  }
-
-  try {
-    logToFile('Fetching post types from API', 'info');
-    const response = await makeWordPressRequest('GET', 'types', undefined, { siteId: resolvedSiteId });
-    postTypesCache.set(resolvedSiteId, {
-      value: response,
-      timestamp: now
-    });
-    await saveCacheToDisk(resolvedSiteId, response);
-    return response;
-  } catch (error: any) {
-    logToFile(`Error fetching post types: ${error.message}`, 'error');
-    throw error;
-  }
+  return getSiteTypes(siteId, forceRefresh);
 }
 
 async function isRankMathActive(forceRefresh = false, siteId?: string): Promise<boolean> {
@@ -143,35 +86,6 @@ async function isRankMathActive(forceRefresh = false, siteId?: string): Promise<
   }
 }
 
-// Helper function to get the correct endpoint for a content type.
-// Exported for reuse by unified-taxonomies.ts (assign_terms_to_content / get_content_terms).
-// Resolves custom post types to their rest_base; falls back to the type as-is.
-export async function getContentEndpoint(contentType: string, siteId?: string): Promise<string> {
-  // Quick return for standard types
-  const standardMap: Record<string, string> = {
-    'post': 'posts',
-    'page': 'pages'
-  };
-
-  if (standardMap[contentType]) {
-    return standardMap[contentType];
-  }
-
-  // For custom post types, we need to get the rest_base from discovered types
-  try {
-    const postTypes = await getPostTypes(false, siteId);
-    if (postTypes[contentType] && postTypes[contentType].rest_base) {
-      return postTypes[contentType].rest_base;
-    }
-  } catch (error) {
-    logToFile(`Failed to get rest_base for content type ${contentType}: ${error}`);
-  }
-
-  // Fallback: try the content type as-is
-  logToFile(`Warning: No rest_base found for content type '${contentType}', using as-is`);
-  return contentType;
-}
-
 // Helper function to parse URL and extract slug and potential post type hints
 function parseUrl(url: string): { slug: string; pathHints: string[] } {
   try {
@@ -200,20 +114,59 @@ function slugToSearchTerm(slug: string): string {
   return slug.replace(/[-_]+/g, ' ').replace(/\s+/g, ' ').trim();
 }
 
-// Helper function to find content across multiple post types
-async function findContentAcrossTypes(slug: string, contentTypes?: string[], siteId?: string) {
-  const typesToSearch = contentTypes || [];
+type ContentTypeSearchResult = { content: any; contentType: string } | null;
+
+export interface FindContentAcrossTypesDependencies {
+  // Overrides the per-type lookup (tests).
+  searchType?: (contentType: string) => Promise<ContentTypeSearchResult>;
+}
+
+// Errors that mean "this type is not searchable here" rather than "the search
+// failed": the type is unknown to the site, or its endpoint is missing (404).
+export function isSkippableSearchError(error: any): boolean {
+  if (error?.response?.status === 404) {
+    return true;
+  }
+  const message = typeof error?.message === 'string' ? error.message : '';
+  return message.startsWith('Unknown content type') || message.startsWith('Invalid content type');
+}
+
+// Helper function to find content across multiple post types.
+// Unknown or missing types are skipped. If no type could be searched at all
+// because of other errors (auth, network, 5xx), throws instead of reporting
+// "not found", so a failed search is not mistaken for missing content.
+// Core internal types (wp_block, wp_template, wp_navigation, wp_font_face, ...)
+// have no public URLs, and some use templated rest_bases that can't be listed
+// directly, so URL/slug search skips them along with attachments and menu items.
+export function isSlugSearchableType(type: string, definition: any): boolean {
+  if (type === 'attachment' || type === 'nav_menu_item' || type.startsWith('wp_')) return false;
+  const restBase = typeof definition?.rest_base === 'string' ? definition.rest_base : type;
+  if (!/^[a-z0-9_-]+$/i.test(restBase)) return false;
+  const namespace = definition?.rest_namespace;
+  return namespace === undefined || namespace === 'wp/v2';
+}
+
+export async function findContentAcrossTypes(
+  slug: string,
+  contentTypes?: string[],
+  siteId?: string,
+  dependencies: FindContentAcrossTypesDependencies = {}
+) {
+  const typesToSearch = contentTypes ? [...contentTypes] : [];
 
   // If no specific content types provided, get all available types
   if (typesToSearch.length === 0) {
     const allTypes = await getPostTypes(false, siteId);
     const typeSet = new Set<string>(
-      Object.keys(allTypes).filter(type => type !== 'attachment' && type !== 'wp_block')
+      Object.entries(allTypes)
+        .filter(([type, definition]) => isSlugSearchableType(type, definition))
+        .map(([type]) => type)
     );
 
-    // Include contract-backed types that aren't exposed in the standard REST API
-    // (e.g. EventON `ajde_events` registered with show_in_rest=false), so they are
-    // resolvable by slug/URL just like list_content can enumerate them.
+    // Include contract-backed types that may be missing from /types (EventON 5.x
+    // exposes ajde_events with show_in_rest=true, but older or filtered installs
+    // may hide it), so they are resolvable by slug/URL just like list_content
+    // can enumerate them.
     try {
       const resolvedContracts = await listResolvedContentTypeContracts(siteId, false);
       for (const { contract } of resolvedContracts) {
@@ -232,56 +185,79 @@ async function findContentAcrossTypes(slug: string, contentTypes?: string[], sit
 
   logToFile(`Searching for slug "${slug}" across content types: ${typesToSearch.join(', ')}`, 'debug');
 
-  const searchOne = async (contentType: string) => {
-    try {
-      // Use the same contract-aware routing list_content relies on, so content
-      // types that aren't REST-exposed still resolve via their plugin endpoint.
-      const preparedRequest = await prepareListContentRequest({
+  const searchType = dependencies.searchType || (async (contentType: string): Promise<ContentTypeSearchResult> => {
+    // Use the same contract-aware routing list_content relies on, so content
+    // types that aren't REST-exposed still resolve via their plugin endpoint.
+    const preparedRequest = await prepareListContentRequest({
+      contentType,
+      siteId,
+      input: { slug, per_page: 100 }
+    });
+
+    const response = await makeWordPressRequest('GET', preparedRequest.endpoint, preparedRequest.queryParams, {
+      siteId,
+      namespace: preparedRequest.namespace,
+      retry404With: preparedRequest.fallbackOn404
+    });
+
+    const items = extractContentCollection(response);
+    // For wp/v2 array responses the `slug` filter is honored server-side, so the
+    // result is authoritative: match by slug, or accept a lone server-filtered row.
+    let match = findItemBySlug(items, slug) || (Array.isArray(response) && items.length === 1 ? items[0] : undefined);
+
+    // Plugin endpoints return an enveloped response (e.g. EventON `{ events: [...] }`)
+    // and ignore the `slug` query param entirely, so the first attempt above can't
+    // confirm a match. Retry with a search term derived from the slug (which these
+    // endpoints do honor) and match the exact slug client-side.
+    if (!match && !Array.isArray(response)) {
+      const searchRequest = await prepareListContentRequest({
         contentType,
         siteId,
-        input: { slug, per_page: 100 }
+        input: { search: slugToSearchTerm(slug), per_page: 100 }
       });
 
-      const response = await makeWordPressRequest('GET', preparedRequest.endpoint, preparedRequest.queryParams, {
+      const searchResponse = await makeWordPressRequest('GET', searchRequest.endpoint, searchRequest.queryParams, {
         siteId,
-        namespace: preparedRequest.namespace,
-        retry404With: preparedRequest.fallbackOn404
+        namespace: searchRequest.namespace,
+        retry404With: searchRequest.fallbackOn404
       });
 
-      const items = extractContentCollection(response);
-      // For wp/v2 array responses the `slug` filter is honored server-side, so the
-      // result is authoritative: match by slug, or accept a lone server-filtered row.
-      let match = findItemBySlug(items, slug) || (Array.isArray(response) && items.length === 1 ? items[0] : undefined);
+      match = findItemBySlug(extractContentCollection(searchResponse), slug);
+    }
 
-      // Plugin endpoints return an enveloped response (e.g. EventON `{ events: [...] }`)
-      // and ignore the `slug` query param entirely, so the first attempt above can't
-      // confirm a match. Retry with a search term derived from the slug (which these
-      // endpoints do honor) and match the exact slug client-side.
-      if (!match && !Array.isArray(response)) {
-        const searchRequest = await prepareListContentRequest({
-          contentType,
-          siteId,
-          input: { search: slugToSearchTerm(slug), per_page: 100 }
-        });
-
-        const searchResponse = await makeWordPressRequest('GET', searchRequest.endpoint, searchRequest.queryParams, {
-          siteId,
-          namespace: searchRequest.namespace,
-          retry404With: searchRequest.fallbackOn404
-        });
-
-        match = findItemBySlug(extractContentCollection(searchResponse), slug);
-      }
-
-      if (match) {
-        logToFile(`Found content with slug "${slug}" in content type "${contentType}"`, 'info');
-        return { content: match, contentType };
-      }
-    } catch (error) {
-      logToFile(`Error searching ${contentType}: ${error}`, 'debug');
+    if (match) {
+      logToFile(`Found content with slug "${slug}" in content type "${contentType}"`, 'info');
+      return { content: match, contentType };
     }
 
     return null;
+  });
+
+  let searched = 0;
+  const failures: string[] = [];
+
+  const searchOne = async (contentType: string): Promise<ContentTypeSearchResult> => {
+    try {
+      const result = await searchType(contentType);
+      searched++;
+      return result;
+    } catch (error: any) {
+      if (isSkippableSearchError(error)) {
+        logToFile(`Skipping ${contentType} in slug search: ${error?.message}`, 'debug');
+      } else {
+        failures.push(`${contentType}: ${error?.message || error}`);
+        logToFile(`Error searching ${contentType}: ${error?.message || error}`, 'error');
+      }
+      return null;
+    }
+  };
+
+  const assertSearchCompleted = () => {
+    if (searched === 0 && failures.length > 0) {
+      throw new Error(
+        `Search could not be completed: every content type lookup failed (${failures.join('; ')})`
+      );
+    }
   };
 
   if (process.env.WORDPRESS_PARALLEL_SEARCH !== 'false' && typesToSearch.length > 1) {
@@ -291,6 +267,7 @@ async function findContentAcrossTypes(slug: string, contentTypes?: string[], sit
       return found;
     }
 
+    assertSearchCompleted();
     return null;
   }
 
@@ -300,8 +277,90 @@ async function findContentAcrossTypes(slug: string, contentTypes?: string[], sit
       return result;
     }
   }
-  
+
+  assertSearchCompleted();
   return null;
+}
+
+function normalizeHost(hostname: string): string {
+  return hostname.toLowerCase().replace(/^www\./, '');
+}
+
+function hostOf(url: string): string | undefined {
+  try {
+    return normalizeHost(new URL(url).hostname);
+  } catch {
+    return undefined;
+  }
+}
+
+export type UrlSiteResolution =
+  | { ok: true; siteId?: string; warning?: string }
+  | { ok: false; error: string };
+
+/**
+ * Decide which configured site a content URL belongs to, by comparing the URL's
+ * host with each site's configured URL (case-insensitive, leading "www." ignored).
+ * `explicitSiteId` must already be resolved to a canonical site ID (aliases expanded).
+ * - no explicit site: use the single matching site; error on several matches. On
+ *   no match, proceed with a warning when exactly one site is configured (headless
+ *   or CDN front ends serve a different host), otherwise error.
+ * - explicit site: error if the host belongs to other configured site(s) only;
+ *   proceed with a warning if the host matches no configured site.
+ */
+export function resolveSiteForContentUrl(
+  url: string,
+  explicitSiteId: string | undefined,
+  sites: Array<{ id: string; url: string }>
+): UrlSiteResolution {
+  const host = hostOf(url);
+  if (!host) {
+    return { ok: false, error: `Could not parse a host from URL: ${url}` };
+  }
+
+  const matches = sites.filter((site) => hostOf(site.url) === host).map((site) => site.id);
+
+  if (explicitSiteId) {
+    if (matches.includes(explicitSiteId)) {
+      return { ok: true, siteId: explicitSiteId };
+    }
+    if (matches.length > 0) {
+      return {
+        ok: false,
+        error: `URL host "${host}" belongs to configured site ${matches.map((id) => `"${id}"`).join(', ')}, ` +
+          `not site_id "${explicitSiteId}". Refusing to search or update the wrong site. ` +
+          `Omit site_id or pass the matching one.`
+      };
+    }
+    return {
+      ok: true,
+      siteId: explicitSiteId,
+      warning: `URL host "${host}" does not match any configured site; searched site "${explicitSiteId}" by slug because site_id was given explicitly.`
+    };
+  }
+
+  if (matches.length === 1) {
+    return { ok: true, siteId: matches[0] };
+  }
+  if (matches.length > 1) {
+    return {
+      ok: false,
+      error: `URL host "${host}" matches several configured sites (${matches.join(', ')}). Pass site_id to choose one.`
+    };
+  }
+  if (sites.length === 1) {
+    return {
+      ok: true,
+      siteId: sites[0].id,
+      warning: `URL host "${host}" does not match the configured site "${sites[0].id}" (${hostOf(sites[0].url) || sites[0].url}); ` +
+        `searched it by slug because it is the only configured site.`
+    };
+  }
+  return {
+    ok: false,
+    error: `URL host "${host}" does not match any configured site (${sites.map((site) => site.id).join(', ') || 'none'}). ` +
+      `Pass site_id explicitly to search that site by slug anyway.`
+  };
 }
 
 // URL → post-type hint table used when resolving a public WP URL to its content type.
@@ -521,12 +580,42 @@ async function processWriteContent<T extends { content?: string; content_format?
   };
 }
 
+// Convert a content_edit value into the fragment spliced into the raw body.
+// Explicit 'html' and 'blocks' are spliced verbatim for every operation. In 'auto',
+// inline splices (replace/insert_before/insert_after into running text) are also
+// verbatim: the full-document pipeline would wrap plain text or markdown-looking
+// text in <p> and nest paragraphs. append/prepend and block-level targets in 'auto'
+// go through processContent, so plain text or markdown becomes block-level HTML.
+// Explicit 'markdown' always converts; for inline targets the single wrapping <p>
+// that marked adds is stripped.
+export async function prepareContentEditValue(edit: ContentEditParams): Promise<string> {
+  const format = edit.content_format || 'auto';
+  const convertToBlocks = edit.convert_to_blocks || false;
+
+  if (format === 'markdown') {
+    const converted = await processContent(edit.value, 'markdown', convertToBlocks);
+    return !convertToBlocks && isInlineContentEditTarget(edit)
+      ? stripSingleWrappingParagraph(converted)
+      : converted;
+  }
+
+  if (format === 'auto' && !isInlineContentEditTarget(edit)) {
+    return processContent(edit.value, 'auto', convertToBlocks);
+  }
+
+  return convertToBlocks && format !== 'blocks' ? convertHtmlToBlocks(edit.value) : edit.value;
+}
+
 // Resolve an update's body before the contract pipeline runs. When content_edit
 // is supplied, fetch the existing raw content (contract-aware), apply the targeted
 // edit, and hand the finished body to the pipeline so partial edits work uniformly
 // across content types — including contract-backed ones. Otherwise fall back to the
-// generic content processing used for full-document writes.
-async function resolveWriteInput(params: UpdateContentParams): Promise<UpdateContentParams> {
+// generic content processing used for full-document writes. `fetchRawContent` is
+// injectable for tests.
+export async function resolveWriteInput(
+  params: UpdateContentParams,
+  fetchRawContent: (contentType: string, id: number, siteId?: string) => Promise<string> = fetchEditableRawContentForType
+): Promise<UpdateContentParams> {
   if (params.content_edit === undefined) {
     return processWriteContent(params);
   }
@@ -538,12 +627,8 @@ async function resolveWriteInput(params: UpdateContentParams): Promise<UpdateCon
   const edit = params.content_edit as ContentEditParams;
   validateContentEdit(edit);
 
-  const existingRaw = await fetchEditableRawContentForType(params.content_type, params.id, params.site_id);
-  const processedFragment = await processContent(
-    edit.value,
-    edit.content_format || 'auto',
-    edit.convert_to_blocks || false
-  );
+  const existingRaw = await fetchRawContent(params.content_type, params.id, params.site_id);
+  const processedFragment = await prepareContentEditValue(edit);
   const mergedContent = applyContentEdit(existingRaw, { ...edit, value: processedFragment });
 
   // The merged body is already in final WordPress form; strip the edit and format
@@ -580,6 +665,27 @@ async function syncRankMathFocusKeywordWithWarnings(
   }
 }
 
+// EventON APIfy deletes always move the event to the trash. Its response
+// (`{ deleted, id, title }`) has no wp/v2 `previous` snapshot, which tells it
+// apart from a wp/v2 fallback that honored `force`.
+export function buildDeleteWarnings(
+  params: { content_type: string; force?: boolean },
+  namespace: string | undefined,
+  response: unknown
+): string[] {
+  const servedByApify =
+    params.content_type === 'ajde_events' &&
+    namespace === 'eventonapify/v1' &&
+    Boolean(response) &&
+    typeof response === 'object' &&
+    !Array.isArray(response) &&
+    !('previous' in (response as Record<string, unknown>));
+
+  return params.force === true && servedByApify
+    ? ['force: true was not applied: EventON APIfy moves events to the trash rather than deleting them permanently. Empty the trash in WordPress to remove the event for good.']
+    : [];
+}
+
 // Attach collected warnings to an object WP response under _mcp_warnings.
 function attachWarnings(response: any, warnings: string[]): any {
   return warnings.length > 0 && response && typeof response === 'object' && !Array.isArray(response)
@@ -602,30 +708,78 @@ async function executeContentUpdate(params: UpdateContentParams): Promise<{ resp
     namespace: itemRequest.namespace,
     retry404With: itemRequest.fallbackOn404
   });
-  const response = await verifyEventONWrite(input, writeResponse);
+  const { response, warnings: verificationWarnings } = await verifyEventONWrite('update', input, writeResponse);
 
   const focusKeyword = readFocusKeywordForRankMathSync(preparedRequest.data, input);
-  const warnings = await syncRankMathFocusKeywordWithWarnings(focusKeyword, params.id, params.site_id);
+  const warnings = [
+    ...verificationWarnings,
+    ...(await syncRankMathFocusKeywordWithWarnings(focusKeyword, params.id, params.site_id))
+  ];
 
   return { response, warnings };
 }
 
-async function verifyEventONWrite(input: { content_type: string; site_id?: string; fields?: Record<string, unknown>; featured_media?: number }, writeResponse: any): Promise<any> {
-  if (input.content_type !== 'ajde_events') {
-    return writeResponse;
+// Confirm an EventON write persisted the requested fields. APIfy write responses
+// already carry the persisted event, so they are checked directly; only a
+// response without event fields (e.g. a wp/v2 fallback) triggers a read-back.
+// The write has already happened, so a field mismatch throws
+// EventONWriteUnverifiedError (carrying the written item's ID), and a failed
+// read-back is only a warning.
+export async function verifyEventONWrite(
+  operation: 'create' | 'update',
+  input: { content_type: string; site_id?: string; fields?: Record<string, unknown>; featured_media?: number },
+  writeResponse: any,
+  request: typeof makeWordPressRequest = makeWordPressRequest
+): Promise<{ response: any; warnings: string[] }> {
+  if (input.content_type !== 'ajde_events' || !hasEventONVerifiableInput(input)) {
+    return { response: writeResponse, warnings: [] };
   }
 
   const eventId = writeResponse && typeof writeResponse === 'object' ? writeResponse.id : undefined;
   if (typeof eventId !== 'number') {
-    throw new Error('EventON write did not return a numeric event ID for persistence verification.');
+    throw new EventONWriteUnverifiedError(
+      operation,
+      writeResponse,
+      'EventON write did not return a numeric event ID for persistence verification.'
+    );
   }
 
-  const persisted = await makeWordPressRequest('GET', `events/${eventId}`, undefined, {
-    siteId: input.site_id,
-    namespace: 'eventonapify/v1'
-  });
-  assertEventONWritePersistence(input, persisted);
-  return persisted;
+  const hasStructuredFields = Boolean(input.fields && Object.keys(input.fields).length > 0);
+  let persisted: unknown = writeResponse;
+
+  if (!isFullEventONEvent(writeResponse)) {
+    if (!hasStructuredFields) {
+      // Generic (no-manifest) wp/v2 write: only featured_media can be checked,
+      // and the wp/v2 response echoes it, so no APIfy read-back is needed.
+      if ('featured_media' in writeResponse) {
+        try {
+          assertEventONWritePersistence(input, writeResponse);
+        } catch (error: any) {
+          throw new EventONWriteUnverifiedError(operation, writeResponse, error?.message ?? String(error), writeResponse);
+        }
+      }
+      return { response: writeResponse, warnings: [] };
+    }
+
+    try {
+      persisted = await request('GET', `events/${eventId}`, undefined, {
+        siteId: input.site_id,
+        namespace: 'eventonapify/v1'
+      });
+    } catch (error: any) {
+      const message = `EventON write succeeded (id ${eventId}) but the verification read-back failed: ${error?.message ?? error}. ` +
+        'Returned the write response unverified.';
+      logToFile(message);
+      return { response: writeResponse, warnings: [message] };
+    }
+  }
+
+  try {
+    assertEventONWritePersistence(input, persisted);
+  } catch (error: any) {
+    throw new EventONWriteUnverifiedError(operation, writeResponse, error?.message ?? String(error), persisted);
+  }
+  return { response: persisted, warnings: [] };
 }
 
 // Contract-aware read used by get_content and find_content_by_url, optionally
@@ -639,8 +793,8 @@ async function fetchContentForType(
   const preparedRequest = await prepareGetContentRequest({ contentType, siteId });
   const fallbackOn404 = preparedRequest.fallbackOn404
     ? {
-        endpoint: `${preparedRequest.fallbackOn404.endpoint}/${id}`,
-        namespace: preparedRequest.fallbackOn404.namespace
+        ...preparedRequest.fallbackOn404,
+        endpoint: `${preparedRequest.fallbackOn404.endpoint}/${id}`
       }
     : undefined;
   const response = await makeWordPressRequest(
@@ -651,7 +805,7 @@ async function fetchContentForType(
   );
 
   return includeRawContent && response && typeof response === 'object'
-    ? withContentRawAlias(response as Record<string, any>)
+    ? withContentRawAlias(response as Record<string, any>, contentType)
     : response;
 }
 
@@ -699,7 +853,7 @@ export function buildDroppedMetaWarning(droppedKeys: string[]): string {
 async function fetchEditableRawContentForType(contentType: string, id: number, siteId?: string): Promise<string> {
   const response = await fetchContentForType(contentType, id, siteId, true);
 
-  const rawContent = (response as any)?.content?.raw;
+  const rawContent = readRawContentBody(response, contentType);
   if (typeof rawContent !== 'string') {
     throw new Error('Partial content edits require WordPress edit access and a REST response that includes content.raw');
   }
@@ -707,8 +861,30 @@ async function fetchEditableRawContentForType(contentType: string, id: number, s
   return rawContent;
 }
 
-function withContentRawAlias<T extends Record<string, any>>(response: T): T & { content_raw?: string } {
-  const rawContent = response?.content?.raw;
+// The stored (unrendered) body of a content item. wp/v2 exposes it as
+// content.raw under context=edit. EventON APIfy event reads (eventonapify/v1)
+// carry no `content` object and return the raw post_content as `description`
+// instead. Edited bodies are written back as `content`, which APIfy accepts as
+// an alias of `description` and wp/v2 takes natively.
+export function readRawContentBody(response: unknown, contentType?: string): string | undefined {
+  if (!response || typeof response !== 'object' || Array.isArray(response)) {
+    return undefined;
+  }
+
+  const item = response as Record<string, any>;
+  if (typeof item.content?.raw === 'string') {
+    return item.content.raw;
+  }
+
+  if (contentType === 'ajde_events' && item.content === undefined && typeof item.description === 'string') {
+    return item.description;
+  }
+
+  return undefined;
+}
+
+export function withContentRawAlias<T extends Record<string, any>>(response: T, contentType?: string): T & { content_raw?: string } {
+  const rawContent = readRawContentBody(response, contentType);
   if (typeof rawContent !== 'string') {
     return response;
   }
@@ -720,6 +896,14 @@ function withContentRawAlias<T extends Record<string, any>>(response: T): T & { 
 }
 
 // Schema definitions
+const listFieldsSchema = z.union([z.literal('full'), z.array(z.string())]).optional().describe(
+  "Response projection, applied client-side. Default: a compact summary per item (id, slug, type, status, date, " +
+  "modified, link, title, excerpt as plain text trimmed to 300 chars, author, featured_media). EventON events get " +
+  "an event summary instead (start/end, timezone, event_status, event_type, tags, location and organizers reduced " +
+  "to id/name/slug, repeat, flags) and RSVP attendees an attendee summary. 'full' returns the untouched WordPress response. " +
+  "An array of top-level field names keeps only those keys per item. Envelope metadata (total, pages) is always kept."
+);
+
 const listContentSchema = z.object({
   content_type: z.string().describe("The content type slug (e.g., 'post', 'page', 'product', 'documentation')"),
   site_id: z.string().optional().describe("Site ID (for multi-site setups)"),
@@ -727,17 +911,19 @@ const listContentSchema = z.object({
   page: z.number().optional().describe("Page number (default 1)"),
   per_page: z.number().min(1).max(100).optional().describe("Items per page (default 10, max 100)"),
   search: z.string().optional().describe("Search term for content title or body"),
-  rsvp: z.enum(['all', 'yes', 'no', 'maybe']).optional().describe("RSVP filter for contract-backed attendee content types such as 'event_rsvps'"),
+  rsvp: z.enum(['all', 'yes', 'no', 'maybe', 'waitlist']).optional().describe("RSVP filter for contract-backed attendee content types such as 'event_rsvps'"),
   slug: z.string().optional().describe("Limit result to content with a specific slug"),
   status: z.string().optional().describe("Content status (publish, draft, etc.)"),
   author: z.union([z.number(), z.array(z.number())]).optional().describe("Author ID or array of IDs"),
   categories: z.union([z.number(), z.array(z.number())]).optional().describe("Category ID or array of IDs (for posts)"),
   tags: z.union([z.number(), z.array(z.number())]).optional().describe("Tag ID or array of IDs (for posts)"),
   parent: z.number().optional().describe("Parent ID (for hierarchical content like pages)"),
-  orderby: z.string().optional().describe("Sort content by parameter"),
+  orderby: z.string().optional().describe("Sort content by parameter. For EventON ajde_events: start_at (default), created (or date), modified, or title"),
   order: z.enum(['asc', 'desc']).optional().describe("Order sort attribute"),
-  after: z.string().optional().describe("ISO8601 date string to get content published after this date"),
-  before: z.string().optional().describe("ISO8601 date string to get content published before this date")
+  after: z.string().optional().describe("ISO8601 date string to get content published after this date. For EventON ajde_events: events starting on or after this date"),
+  before: z.string().optional().describe("ISO8601 date string to get content published before this date. For EventON ajde_events: events starting before this date"),
+  fields: listFieldsSchema,
+  refresh_cache: z.boolean().optional().describe("Force refresh the content type and manifest caches")
 }).passthrough();
 
 const getContentSchema = z.object({
@@ -746,6 +932,10 @@ const getContentSchema = z.object({
   site_id: z.string().optional().describe("Site ID (for multi-site setups)"),
   include_raw_content: z.boolean().optional().default(false).describe(
     "Fetch the content with WordPress edit context and include a top-level content_raw field for exact matching"
+  ),
+  fields: z.union([z.literal('full'), z.array(z.string())]).optional().describe(
+    "Response projection. Default: the full item minus _links and guid. 'full' returns the untouched response. " +
+    "An array of top-level field names keeps only those keys."
   )
 });
 
@@ -782,7 +972,7 @@ const contentEditSchema = z.object({
     "Partial content edit operation: append, prepend, insert_before, insert_after, or replace"
   ),
   value: z.string().describe(
-    "Content fragment to insert or use as the replacement. Accepts Gutenberg blocks, HTML, or Markdown."
+    "Content fragment to insert or use as the replacement. See content_format for when it is converted or spliced verbatim."
   ),
   target_text: z.string().optional().describe(
     "Exact raw content fragment to target for insert_before, insert_after, or replace"
@@ -791,7 +981,11 @@ const contentEditSchema = z.object({
     "Optional 1-based occurrence to target when target_text appears multiple times"
   ),
   content_format: z.enum(['auto', 'markdown', 'html', 'blocks']).optional().default('auto').describe(
-    "Format hint for the content_edit value"
+    "Format of the content_edit value. 'html' and 'blocks' splice the value verbatim for every operation. " +
+    "'auto' (default) splices verbatim for insert_before/insert_after/replace on inline text; for append, " +
+    "prepend, or a block-level target_text it detects the format and converts plain text or markdown to " +
+    "block HTML. 'markdown' always converts to HTML; for insert_before/insert_after/replace on inline text, " +
+    "the single wrapping <p> is removed."
   ),
   convert_to_blocks: z.boolean().optional().default(false).describe(
     "Convert the content_edit value to Gutenberg blocks before applying it"
@@ -896,7 +1090,11 @@ const findContentByUrlSchema = z.object({
 const getContentBySlugSchema = z.object({
   slug: z.string().describe("The slug to search for"),
   site_id: z.string().optional().describe("Site ID (for multi-site setups)"),
-  content_types: z.array(z.string()).optional().describe("Content types to search in (defaults to all)")
+  content_types: z.array(z.string()).optional().describe("Content types to search in (defaults to all)"),
+  fields: z.union([z.literal('full'), z.array(z.string())]).optional().describe(
+    "Projection of the matched item. Default: the same compact summary as list_content (no content body; " +
+    "use get_content for that). 'full' returns the untouched item; an array keeps only those top-level keys."
+  )
 });
 
 // Type definitions
@@ -1003,15 +1201,24 @@ async function syncRankMathFocusKeyword(
   );
 }
 
+const CONTRACT_DESCRIPTION_KEYS = ['fields', 'validation_rules', 'examples'];
+
+function omitKeys<T extends Record<string, any>>(value: T, keys: string[]): Partial<T> {
+  const result: Record<string, any> = { ...value };
+  for (const key of keys) delete result[key];
+  return result as Partial<T>;
+}
+
 export const unifiedContentTools: Tool[] = [
   {
     name: "list_content",
-    description: "Lists content of any type (posts, pages, or custom post types) with filtering and pagination",
+    description: "Lists content of any type (posts, pages, or custom post types) with filtering and pagination. " +
+      "Returns compact item summaries by default (no content body); use get_content for the full item, or fields: 'full'.",
     inputSchema: { type: "object", properties: listContentSchema.shape }
   },
   {
     name: "get_content",
-    description: "Gets specific content by ID and content type",
+    description: "Gets specific content by ID and content type. Returns the full item minus _links and guid unless fields: 'full'.",
     inputSchema: { type: "object", properties: getContentSchema.shape }
   },
   {
@@ -1053,7 +1260,7 @@ export const unifiedContentTools: Tool[] = [
   },
   {
     name: "get_content_by_slug",
-    description: "Searches for content by slug across one or more content types",
+    description: "Searches for content by slug across one or more content types. Returns a compact summary of the match by default; use get_content for the body.",
     inputSchema: { type: "object", properties: getContentBySlugSchema.shape }
   }
 ];
@@ -1064,7 +1271,8 @@ export const unifiedContentHandlers = {
       const preparedRequest = await prepareListContentRequest({
         contentType: params.content_type,
         siteId: params.site_id,
-        input: params
+        input: params,
+        refreshCache: params.refresh_cache === true
       });
 
       const response = await makeWordPressRequest('GET', preparedRequest.endpoint, preparedRequest.queryParams, {
@@ -1072,13 +1280,19 @@ export const unifiedContentHandlers = {
         namespace: preparedRequest.namespace,
         retry404With: preparedRequest.fallbackOn404
       });
-      const filteredResponse = applyListContentResponseFilter(response, preparedRequest.responseFilter);
-      
+      // Filtering, ordering and pagination are server-side; envelope totals are
+      // passed through untouched. Warnings attach only to enveloped (plugin)
+      // responses: a wp/v2 fallback array honors the params the warnings name.
+      const projectedResponse = attachWarnings(
+        projectListResponse(response, params.fields as ContentFieldsSelection | undefined),
+        preparedRequest.warnings || []
+      );
+
       return {
         toolResult: {
           content: [{ 
             type: 'text', 
-            text: JSON.stringify(filteredResponse, null, 2) 
+            text: JSON.stringify(projectedResponse, null, 2) 
           }],
           isError: false
         }
@@ -1115,7 +1329,7 @@ export const unifiedContentHandlers = {
         toolResult: {
           content: [{
             type: 'text',
-            text: JSON.stringify(response, null, 2)
+            text: JSON.stringify(projectContentItem(response, params.fields), null, 2)
           }],
           isError: false
         }
@@ -1147,16 +1361,19 @@ export const unifiedContentHandlers = {
         namespace: preparedRequest.namespace,
         retry404With: preparedRequest.fallbackOn404
       });
-      const response = await verifyEventONWrite(input, writeResponse);
+      const { response, warnings: verificationWarnings } = await verifyEventONWrite('create', input, writeResponse);
 
       // Only sync when the create response carries a numeric id to target.
       const newId = response && typeof response === 'object' && typeof (response as any).id === 'number'
         ? (response as any).id
         : undefined;
       const focusKeyword = readFocusKeywordForRankMathSync(preparedRequest.data, input);
-      const warnings = newId !== undefined
-        ? await syncRankMathFocusKeywordWithWarnings(focusKeyword, newId, params.site_id)
-        : [];
+      const warnings = [
+        ...verificationWarnings,
+        ...(newId !== undefined
+          ? await syncRankMathFocusKeywordWithWarnings(focusKeyword, newId, params.site_id)
+          : [])
+      ];
 
       const responseContent: any[] = [{
         type: 'text',
@@ -1174,9 +1391,11 @@ export const unifiedContentHandlers = {
         }
       };
     } catch (error: any) {
-      const message = error instanceof ContractValidationError || error instanceof ContractCompatibilityError
-        ? formatContractError(error)
-        : `Error creating content: ${error.message}`;
+      const message = error instanceof EventONWriteUnverifiedError
+        ? formatEventONWriteUnverifiedError(error)
+        : error instanceof ContractValidationError || error instanceof ContractCompatibilityError
+          ? formatContractError(error)
+          : `Error creating content: ${error.message}`;
 
       return {
         toolResult: {
@@ -1210,9 +1429,11 @@ export const unifiedContentHandlers = {
         }
       };
     } catch (error: any) {
-      const message = error instanceof ContractValidationError || error instanceof ContractCompatibilityError
-        ? formatContractError(error)
-        : `Error updating content: ${error.message}`;
+      const message = error instanceof EventONWriteUnverifiedError
+        ? formatEventONWriteUnverifiedError(error)
+        : error instanceof ContractValidationError || error instanceof ContractCompatibilityError
+          ? formatContractError(error)
+          : `Error updating content: ${error.message}`;
 
       return {
         toolResult: {
@@ -1245,7 +1466,7 @@ export const unifiedContentHandlers = {
         toolResult: {
           content: [{ 
             type: 'text', 
-            text: JSON.stringify(response, null, 2) 
+            text: JSON.stringify(attachWarnings(response, buildDeleteWarnings(params, preparedRequest.namespace, response)), null, 2) 
           }],
           isError: false
         }
@@ -1285,7 +1506,7 @@ export const unifiedContentHandlers = {
         interpreter_ready: resolvedContracts.find(({ contract }) => contract.slug === slug)?.executable || false
       }));
 
-      // Append contract-only types not visible in the REST API (e.g. show_in_rest = false)
+      // Append contract-only types missing from /types (e.g. a filtered or older install with show_in_rest=false)
       for (const { contract, manifest, executable } of resolvedContracts) {
         if (!restSlugs.has(contract.slug)) {
           formattedTypes.push({
@@ -1365,11 +1586,12 @@ export const unifiedContentHandlers = {
           has_extended_schema: contractResolution.status === 'supported',
           interpreter_ready: contractResolution.executionSupport.executable,
           message: contractResolution.message || null,
-          definition: contractResolution.contract || null,
+          // fields, validation_rules and examples are published once, in `description`.
+          definition: contractResolution.contract ? omitKeys(contractResolution.contract, CONTRACT_DESCRIPTION_KEYS) : null,
           source: contractResolution.manifest?.source || null,
           provider: contractResolution.manifest?.provider || null,
           description: contractDescription,
-          issues: contractResolution.issues,
+          // Manifest issues are listed once, under manifest_cache.
           execution_issues: contractResolution.executionSupport.issues
         },
         manifest_cache: {
@@ -1403,7 +1625,23 @@ export const unifiedContentHandlers = {
 
   find_content_by_url: async (params: FindContentByUrlParams) => {
     try {
-      const result = await findContentByUrl(params.url, params.site_id);
+      const siteResolution = resolveSiteForContentUrl(
+        params.url,
+        params.site_id ? siteManager.resolveSiteId(params.site_id) : undefined,
+        siteManager.getAllSites()
+      );
+      if (!siteResolution.ok) {
+        return {
+          toolResult: {
+            content: [{ type: 'text', text: `Error finding content by URL: ${siteResolution.error}` }],
+            isError: true
+          }
+        };
+      }
+      const siteId = siteResolution.siteId;
+      const siteWarnings = siteResolution.warning ? [siteResolution.warning] : [];
+
+      const result = await findContentByUrl(params.url, siteId);
 
       if (!result) {
         throw new Error(`No content found with URL: ${params.url}`);
@@ -1417,14 +1655,14 @@ export const unifiedContentHandlers = {
         const { response, warnings } = await executeContentUpdate({
           content_type: contentType,
           id: content.id,
-          site_id: params.site_id,
+          site_id: siteId,
           ...params.update_fields
         } as UpdateContentParams);
 
         // The write response already echoes the saved state (like update_content);
         // only re-read when include_raw_content needs the context=edit content_raw.
         const saved = params.include_raw_content
-          ? await fetchContentForType(contentType, content.id, params.site_id, true)
+          ? await fetchContentForType(contentType, content.id, siteId, true)
           : response;
 
         const responseContent: any[] = [{
@@ -1433,8 +1671,10 @@ export const unifiedContentHandlers = {
             found: true,
             content_type: contentType,
             content_id: content.id,
+            site_id: siteId,
             original_url: params.url,
             updated: true,
+            warnings: siteWarnings.length > 0 ? siteWarnings : undefined,
             content: attachWarnings(saved, warnings),
             content_raw: params.include_raw_content ? (saved as any).content_raw : undefined
           }, null, 2)
@@ -1453,7 +1693,7 @@ export const unifiedContentHandlers = {
       }
 
       const responseContent = params.include_raw_content
-        ? await fetchContentForType(contentType, content.id, params.site_id, true)
+        ? await fetchContentForType(contentType, content.id, siteId, true)
         : content;
 
       return {
@@ -1464,7 +1704,9 @@ export const unifiedContentHandlers = {
               found: true,
               content_type: contentType,
               content_id: content.id,
+              site_id: siteId,
               original_url: params.url,
+              warnings: siteWarnings.length > 0 ? siteWarnings : undefined,
               content: responseContent,
               content_raw: params.include_raw_content ? (responseContent as any).content_raw : undefined
             }, null, 2)
@@ -1473,9 +1715,11 @@ export const unifiedContentHandlers = {
         }
       };
     } catch (error: any) {
-      const message = error instanceof ContractValidationError || error instanceof ContractCompatibilityError
-        ? formatContractError(error)
-        : `Error finding content by URL: ${error.message}`;
+      const message = error instanceof EventONWriteUnverifiedError
+        ? formatEventONWriteUnverifiedError(error)
+        : error instanceof ContractValidationError || error instanceof ContractCompatibilityError
+          ? formatContractError(error)
+          : `Error finding content by URL: ${error.message}`;
 
       return {
         toolResult: {
@@ -1504,7 +1748,7 @@ export const unifiedContentHandlers = {
             text: JSON.stringify({
               found: true,
               content_type: result.contentType,
-              content: result.content
+              content: projectListItem(result.content, params.fields)
             }, null, 2)
           }],
           isError: false
@@ -1523,75 +1767,3 @@ export const unifiedContentHandlers = {
     }
   }
 };
-
-function applyListContentResponseFilter(
-  response: unknown,
-  responseFilter?: {
-    eventStartAfter?: string;
-    eventStartBefore?: string;
-    eventStartOrder?: 'asc' | 'desc';
-  }
-): unknown {
-  if (
-    !responseFilter ||
-    !response ||
-    typeof response !== 'object' ||
-    Array.isArray(response)
-  ) {
-    return response;
-  }
-
-  const payload = response as Record<string, unknown>;
-  const events = Array.isArray(payload.events) ? payload.events : undefined;
-
-  if (!events) {
-    return response;
-  }
-
-  const filteredEvents = events
-    .filter((event) => {
-      if (!event || typeof event !== 'object' || Array.isArray(event)) {
-        return false;
-      }
-
-      const startDate = readEventStartDate(event as Record<string, unknown>);
-      if (!startDate) {
-        return false;
-      }
-
-      if (responseFilter.eventStartAfter && startDate < responseFilter.eventStartAfter) {
-        return false;
-      }
-
-      if (responseFilter.eventStartBefore && startDate >= responseFilter.eventStartBefore) {
-        return false;
-      }
-
-      return true;
-    })
-    .sort((left, right) => {
-      const leftDate = readEventStartDate(left as Record<string, unknown>) || '';
-      const rightDate = readEventStartDate(right as Record<string, unknown>) || '';
-      const comparison = leftDate.localeCompare(rightDate);
-      return responseFilter.eventStartOrder === 'desc' ? comparison * -1 : comparison;
-    });
-
-  return {
-    ...payload,
-    total: filteredEvents.length,
-    page: 1,
-    pages: 1,
-    per_page: filteredEvents.length,
-    events: filteredEvents
-  };
-}
-
-function readEventStartDate(event: Record<string, unknown>): string | undefined {
-  const startAt = typeof event.start_at === 'string' ? event.start_at : undefined;
-  if (startAt) {
-    return startAt.slice(0, 10);
-  }
-
-  const startDate = typeof event.start_date === 'string' ? event.start_date : undefined;
-  return startDate;
-}

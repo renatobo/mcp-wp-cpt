@@ -2,6 +2,28 @@ import axios, { AxiosInstance } from 'axios';
 import { userAgentHeader } from './user-agent.js';
 import { logToFile } from '../wordpress.js';
 
+const DEFAULT_REQUEST_TIMEOUT_MS = 30000;
+
+/**
+ * Request timeout for outbound HTTP calls, from WORDPRESS_REQUEST_TIMEOUT_MS
+ * (positive integer milliseconds). Falls back to 30s on missing or invalid values
+ * so one hung host cannot freeze a tool call indefinitely.
+ */
+export function getRequestTimeoutMs(envValue: string | undefined = process.env.WORDPRESS_REQUEST_TIMEOUT_MS): number {
+  if (envValue === undefined || envValue.trim() === '') {
+    return DEFAULT_REQUEST_TIMEOUT_MS;
+  }
+
+  const trimmed = envValue.trim();
+  const parsed = Number(trimmed);
+  if (!/^\d+$/.test(trimmed) || !Number.isSafeInteger(parsed) || parsed <= 0) {
+    logToFile(`Ignoring invalid WORDPRESS_REQUEST_TIMEOUT_MS "${envValue}"; using ${DEFAULT_REQUEST_TIMEOUT_MS}ms`, 'error');
+    return DEFAULT_REQUEST_TIMEOUT_MS;
+  }
+
+  return parsed;
+}
+
 export interface SiteConfig {
   id: string;
   url: string;
@@ -220,8 +242,12 @@ export class SiteManager {
 
     const auth = Buffer.from(`${site.username}:${site.password}`).toString('base64');
     
+    // allowAbsoluteUrls: false keeps every request on baseURL, so an absolute URL
+    // smuggled in as an endpoint cannot carry the Authorization header off-site.
     const client = axios.create({
       baseURL,
+      allowAbsoluteUrls: false,
+      timeout: getRequestTimeoutMs(),
       headers: {
         'Content-Type': 'application/json',
         'Authorization': `Basic ${auth}`,
@@ -234,8 +260,16 @@ export class SiteManager {
       await client.get('');
       logToFile(`Successfully connected to site '${site.id}' namespace '${normalizedNamespace}' at ${baseURL}`);
     } catch (error: any) {
-      logToFile(`Failed to connect to site '${site.id}' namespace '${normalizedNamespace}': ${error.message}`);
-      throw new Error(`Failed to connect to site '${site.id}' namespace '${normalizedNamespace}': ${error.message}`);
+      const message = `Failed to connect to site '${site.id}' namespace '${normalizedNamespace}': ${error?.message}`;
+      logToFile(message);
+      // Rethrow the original AxiosError (with an augmented message) so callers
+      // can still read response.status, e.g. a 404 when a plugin namespace is
+      // not registered, and run their fallback or classification logic.
+      if (axios.isAxiosError(error)) {
+        error.message = message;
+        throw error;
+      }
+      throw new Error(message);
     }
 
     return client;

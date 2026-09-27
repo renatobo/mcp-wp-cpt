@@ -44,6 +44,18 @@ test('splitNamespacedEndpoint parses custom plugin namespaces', () => {
   assert.equal(result.endpoint, 'events/{event_id}/rsvps');
 });
 
+const DISABLED_CODES = ['eventon_apify_disabled', 'eventon_apify_capability_disabled'];
+
+// wp/v2 fallback params for the shared EventON list input below: after/before
+// and a WordPress orderby pass through untouched (publish-date semantics).
+const WP_V2_FALLBACK_LIST_PARAMS = {
+  after: '2025-12-31',
+  before: '2027-01-01',
+  per_page: 100,
+  order: 'asc',
+  orderby: 'date'
+};
+
 function getEventRsvpResolution(overrides: Record<string, unknown> = {}) {
   return {
     siteId: 'staging',
@@ -129,7 +141,8 @@ test('buildGetContentRequest uses contract routes for direct content reads', () 
   assert.equal(prepared.namespace, 'eventonapify/v1');
   assert.deepEqual(prepared.fallbackOn404, {
     endpoint: 'ajde_events',
-    namespace: 'wp/v2'
+    namespace: 'wp/v2',
+    on403Codes: DISABLED_CODES
   });
 });
 
@@ -149,19 +162,19 @@ test('buildContractListRequest prefers the EventON read endpoint for ajde_events
   assert.equal(prepared.namespace, 'eventonapify/v1');
   assert.deepEqual(prepared.fallbackOn404, {
     endpoint: 'ajde_events',
-    namespace: 'wp/v2'
+    namespace: 'wp/v2',
+    on403Codes: DISABLED_CODES,
+    data: WP_V2_FALLBACK_LIST_PARAMS
   });
   assert.deepEqual(prepared.queryParams, {
     starts_on_or_after: '2025-12-31',
     starts_before: '2027-01-01',
     per_page: 100,
-    order: 'asc'
+    order: 'asc',
+    orderby: 'created'
   });
-  assert.deepEqual(prepared.responseFilter, {
-    eventStartAfter: '2025-12-31',
-    eventStartBefore: '2027-01-01',
-    eventStartOrder: 'asc'
-  });
+  assert.equal((prepared as any).responseFilter, undefined);
+  assert.equal(prepared.warnings, undefined);
 });
 
 test('buildListContentRequest uses contract list routes even when write support is incomplete', () => {
@@ -279,19 +292,19 @@ test('buildListContentRequest gives EventON lists start-date semantics with no r
   assert.equal(prepared.namespace, 'eventonapify/v1');
   assert.deepEqual(prepared.fallbackOn404, {
     endpoint: 'ajde_events',
-    namespace: 'wp/v2'
+    namespace: 'wp/v2',
+    on403Codes: DISABLED_CODES,
+    data: WP_V2_FALLBACK_LIST_PARAMS
   });
   assert.deepEqual(prepared.queryParams, {
     starts_on_or_after: '2025-12-31',
     starts_before: '2027-01-01',
     per_page: 100,
-    order: 'asc'
+    order: 'asc',
+    orderby: 'created'
   });
-  assert.deepEqual(prepared.responseFilter, {
-    eventStartAfter: '2025-12-31',
-    eventStartBefore: '2027-01-01',
-    eventStartOrder: 'asc'
-  });
+  assert.equal((prepared as any).responseFilter, undefined);
+  assert.equal(prepared.warnings, undefined);
 });
 
 test('buildListContentRequest still uses direct EventON reads when list support is omitted', () => {
@@ -317,11 +330,75 @@ test('buildListContentRequest still uses direct EventON reads when list support 
     starts_on_or_after: '2025-12-31',
     starts_before: '2027-01-01',
     per_page: 100,
-    order: 'asc'
+    order: 'asc',
+    orderby: 'created'
   });
-  assert.deepEqual(prepared.responseFilter, {
-    eventStartAfter: '2025-12-31',
-    eventStartBefore: '2027-01-01',
-    eventStartOrder: 'asc'
+  assert.equal((prepared as any).responseFilter, undefined);
+  assert.equal(prepared.warnings, undefined);
+});
+
+test('EventON reads from an eventonapify/v1/events preferred endpoint keep the wp/v2 fallback', () => {
+  const resolution = getEventResolution({
+    contract: {
+      ...getEventResolution().contract,
+      preferred_endpoint: 'eventonapify/v1/events',
+      related_endpoints: [{ name: 'item', endpoint: 'eventonapify/v1/events/{id}' }],
+      supported_operations: ['list', 'get', 'create', 'update', 'delete']
+    }
   });
+
+  const get = buildGetContentRequest(resolution);
+  assert.equal(get.endpoint, 'events');
+  assert.equal(get.namespace, 'eventonapify/v1');
+  assert.deepEqual(get.fallbackOn404, { endpoint: 'ajde_events', namespace: 'wp/v2', on403Codes: DISABLED_CODES });
+
+  const list = buildListContentRequest({ upcoming: true, orderby: 'title' }, resolution);
+  assert.equal(list.endpoint, 'events');
+  assert.deepEqual(list.queryParams, { upcoming: true, orderby: 'title' });
+  assert.deepEqual(list.fallbackOn404, {
+    endpoint: 'ajde_events',
+    namespace: 'wp/v2',
+    on403Codes: DISABLED_CODES,
+    data: { orderby: 'title' }
+  });
+});
+
+test('EventON lists drop and warn about params the APIfy endpoint ignores', () => {
+  const prepared = buildListContentRequest(
+    { categories: [3], tags: [4], author: 2, per_page: 5, orderby: 'start_at', search: 'bike' },
+    getEventResolution()
+  );
+
+  assert.deepEqual(prepared.queryParams, { per_page: 5, orderby: 'start_at', search: 'bike' });
+  assert.equal(prepared.warnings?.length, 1);
+  assert.match(prepared.warnings![0], /categories, tags, author/);
+  // wp/v2 has no start_at order; the fallback keeps the native filters.
+  assert.deepEqual(prepared.fallbackOn404?.data, { categories: [3], tags: [4], author: 2, per_page: 5, search: 'bike' });
+});
+
+test('EventON lists accept filters a manifest read_contract publishes', () => {
+  const prepared = buildListContentRequest(
+    { venue: 'garage' },
+    getEventResolution({
+      contract: { ...getEventResolution().contract, read_contract: { filters: { venue: {} } } }
+    })
+  );
+
+  assert.deepEqual(prepared.queryParams, { venue: 'garage' });
+  assert.equal(prepared.warnings, undefined);
+});
+
+test('buildGetContentRequest refuses item reads on list-only nested contracts', () => {
+  assert.throws(
+    () => buildGetContentRequest(getEventRsvpResolution()),
+    (error: any) => {
+      assert.equal(error.code, 'contract_compatibility_error');
+      assert.match(error.message, /does not support single-item reads/);
+      return true;
+    }
+  );
+});
+
+test('extractContentCollection reads the RSVP attendees envelope', () => {
+  assert.deepEqual(extractContentCollection({ attendees: [{ id: 9 }], total: 1 }), [{ id: 9 }]);
 });

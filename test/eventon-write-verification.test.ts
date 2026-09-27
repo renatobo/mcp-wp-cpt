@@ -2,7 +2,9 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   assertEventONWritePersistence,
-  EventONWriteVerificationError
+  EventONWriteVerificationError,
+  normalizeTime,
+  sanitizeTermSlug
 } from '../src/content/eventon-write-verification.js';
 
 const input = {
@@ -68,4 +70,53 @@ test('EventON write verification rejects a successful response with discarded fi
       return true;
     }
   );
+});
+
+test('EventON write verification normalizes times to zero-padded HH:MM', () => {
+  assert.doesNotThrow(() => assertEventONWritePersistence(
+    { fields: { start_time: '8:05', end_time: '20:30:00' } },
+    { ...persisted, start_time: '08:05', end_time: '20:30' }
+  ));
+  assert.equal(normalizeTime('7:00'), '07:00');
+  assert.equal(normalizeTime('07:00:59'), '07:00');
+  assert.equal(normalizeTime('noon'), 'noon');
+});
+
+test('EventON write verification skips end checks when the end time is hidden without spanning', () => {
+  const hiddenEnd = { fields: { start_date: '2026-09-10', end_date: '2026-09-12', end_time: '20:30', flags: { hide_end_time: true } } };
+  const pinned = { ...persisted, end_date: '2026-09-10', end_time: '23:59', flags: { hide_end_time: true, span_hidden_end: false } };
+  assert.doesNotThrow(() => assertEventONWritePersistence(hiddenEnd, pinned));
+
+  const spanning = { fields: { ...hiddenEnd.fields, flags: { hide_end_time: true, span_hidden_end: true } } };
+  assert.throws(
+    () => assertEventONWritePersistence(spanning, { ...pinned, flags: { hide_end_time: true, span_hidden_end: true } }),
+    /end_date/
+  );
+});
+
+test('EventON write verification prefers term_id and compares slugs sanitized', () => {
+  assert.doesNotThrow(() => assertEventONWritePersistence(
+    { fields: { location: { term_id: 414, name: 'Old name' } } },
+    persisted
+  ));
+  assert.throws(
+    () => assertEventONWritePersistence({ fields: { location: { term_id: 999 } } }, persisted),
+    /location/
+  );
+  assert.doesNotThrow(() => assertEventONWritePersistence(
+    { fields: { organizers: [{ slug: ' Ducati Riders of Orange County ' }] } },
+    persisted
+  ));
+  assert.equal(sanitizeTermSlug("Mulleady's Sports Pub & Grill"), 'mulleadys-sports-pub-grill');
+});
+
+test('EventON write verification ignores an empty timezone', () => {
+  assert.doesNotThrow(() => assertEventONWritePersistence(
+    { fields: { timezone: '' } },
+    { ...persisted, timezone: { key: 'UTC', text: '' } }
+  ));
+  assert.doesNotThrow(() => assertEventONWritePersistence(
+    { fields: { timezone: { key: '' } } },
+    persisted
+  ));
 });

@@ -4,6 +4,8 @@ import { makeWordPressRequest } from '../wordpress.js';
 import { WPComment } from '../types/wordpress-types.js';
 import { z } from 'zod';
 
+const siteIdSchema = z.string().optional().describe('Site ID (for multi-site setups)');
+
 // Schema for listing comments
 const listCommentsSchema = z.object({
   page: z.coerce.number().optional().describe("Page number (default 1)"),
@@ -17,12 +19,14 @@ const listCommentsSchema = z.object({
   status: z.enum(['approve', 'hold', 'spam', 'trash']).optional().describe("Comment status"),
   type: z.string().optional().describe("Comment type"),
   orderby: z.enum(['date', 'date_gmt', 'id', 'include', 'post', 'parent', 'type']).optional().describe("Sort comments by parameter"),
-  order: z.enum(['asc', 'desc']).optional().describe("Order sort attribute ascending or descending")
+  order: z.enum(['asc', 'desc']).optional().describe("Order sort attribute ascending or descending"),
+  site_id: siteIdSchema
 });
 
 // Schema for getting a single comment
 const getCommentSchema = z.object({
-  id: z.coerce.number().describe("Comment ID")
+  id: z.coerce.number().describe("Comment ID"),
+  site_id: siteIdSchema
 }).strict();
 
 // Schema for creating a comment
@@ -34,7 +38,8 @@ const createCommentSchema = z.object({
   author_url: z.string().url().optional().describe("URL for the comment author"),
   content: z.string().describe("The content of the comment"),
   parent: z.coerce.number().optional().describe("The ID of the parent comment"),
-  status: z.enum(['approve', 'hold']).optional().describe("State of the comment")
+  status: z.enum(['approve', 'hold']).optional().describe("State of the comment"),
+  site_id: siteIdSchema
 }).strict();
 
 // Schema for updating a comment
@@ -47,13 +52,15 @@ const updateCommentSchema = z.object({
   author_url: z.string().url().optional().describe("URL for the comment author"),
   content: z.string().optional().describe("The content of the comment"),
   parent: z.coerce.number().optional().describe("The ID of the parent comment"),
-  status: z.enum(['approve', 'hold', 'spam', 'trash']).optional().describe("State of the comment")
+  status: z.enum(['approve', 'hold', 'spam', 'trash']).optional().describe("State of the comment"),
+  site_id: siteIdSchema
 }).strict();
 
 // Schema for deleting a comment
 const deleteCommentSchema = z.object({
   id: z.coerce.number().describe("Comment ID"),
-  force: z.boolean().optional().describe("Whether to bypass trash and force deletion")
+  force: z.boolean().optional().describe("Whether to bypass trash and force deletion"),
+  site_id: siteIdSchema
 }).strict();
 
 // TypeScript types for the parameters
@@ -96,7 +103,8 @@ export const commentTools: Tool[] = [
 export const commentHandlers = {
   list_comments: async (params: ListCommentsParams) => {
     try {
-      const response = await makeWordPressRequest('GET', "comments", params);
+      const { site_id, ...query } = params;
+      const response = await makeWordPressRequest('GET', "comments", query, { siteId: site_id });
       const comments: WPComment[] = response;
       return {
         toolResult: {
@@ -116,7 +124,7 @@ export const commentHandlers = {
   
   get_comment: async (params: GetCommentParams) => {
     try {
-      const response = await makeWordPressRequest('GET', `comments/${params.id}`);
+      const response = await makeWordPressRequest('GET', `comments/${params.id}`, undefined, { siteId: params.site_id });
       const comment: WPComment = response;
       return {
         toolResult: {
@@ -136,7 +144,8 @@ export const commentHandlers = {
   
   create_comment: async (params: CreateCommentParams) => {
     try {
-      const response = await makeWordPressRequest('POST', "comments", params);
+      const { site_id, ...commentData } = params;
+      const response = await makeWordPressRequest('POST', "comments", commentData, { siteId: site_id });
       const comment: WPComment = response;
       return {
         toolResult: {
@@ -156,8 +165,8 @@ export const commentHandlers = {
   
   update_comment: async (params: UpdateCommentParams) => {
     try {
-      const { id, ...updateData } = params;
-      const response = await makeWordPressRequest('POST', `comments/${id}`, updateData);
+      const { id, site_id, ...updateData } = params;
+      const response = await makeWordPressRequest('POST', `comments/${id}`, updateData, { siteId: site_id });
       const comment: WPComment = response;
       return {
         toolResult: {
@@ -177,7 +186,7 @@ export const commentHandlers = {
   
   delete_comment: async (params: DeleteCommentParams) => {
     try {
-      const response = await makeWordPressRequest('DELETE', `comments/${params.id}`, { force: params.force });
+      const response = await makeWordPressRequest('DELETE', `comments/${params.id}`, { force: params.force }, { siteId: params.site_id });
       const comment: WPComment = response;
       return {
         toolResult: {

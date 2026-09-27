@@ -3,6 +3,8 @@ import { Tool } from '@modelcontextprotocol/sdk/types.js';
 import { makeWordPressRequest } from '../wordpress.js';
 import { WPUser } from '../types/wordpress-types.js';
 import { z } from 'zod';
+
+const siteIdSchema = z.string().optional().describe('Site ID (for multi-site setups)');
 import { zodToJsonSchema } from 'zod-to-json-schema';
 
 const listUsersSchema = z.object({
@@ -12,12 +14,14 @@ const listUsersSchema = z.object({
   context: z.enum(['view', 'embed', 'edit']).optional().describe("Scope under which the request is made"),
   orderby: z.enum(['id', 'include', 'name', 'registered_date', 'slug', 'email', 'url']).optional().describe("Sort users by parameter"),
   order: z.enum(['asc', 'desc']).optional().describe("Order sort attribute ascending or descending"),
-  roles: z.array(z.string()).optional().describe("Array of role names to filter by")
+  roles: z.array(z.string()).optional().describe("Array of role names to filter by"),
+  site_id: siteIdSchema
 });
 
 const getUserSchema = z.object({
   id: z.coerce.number().describe("User ID"),
-  context: z.enum(['view', 'embed', 'edit']).optional().describe("Scope under which the request is made")
+  context: z.enum(['view', 'embed', 'edit']).optional().describe("Scope under which the request is made"),
+  site_id: siteIdSchema
 }).strict();
 
 const createUserSchema = z.object({
@@ -32,7 +36,8 @@ const createUserSchema = z.object({
   nickname: z.string().optional().describe("Nickname for the user"),
   slug: z.string().optional().describe("Slug for the user"),
   roles: z.array(z.string()).optional().describe("Roles assigned to the user"),
-  password: z.string().describe("Password for the user")
+  password: z.string().describe("Password for the user"),
+  site_id: siteIdSchema
 }).strict();
 
 const updateUserSchema = z.object({
@@ -48,13 +53,15 @@ const updateUserSchema = z.object({
   nickname: z.string().optional().describe("Nickname for the user"),
   slug: z.string().optional().describe("Slug for the user"),
   roles: z.array(z.string()).optional().describe("Roles assigned to the user"),
-  password: z.string().optional().describe("Password for the user")
+  password: z.string().optional().describe("Password for the user"),
+  site_id: siteIdSchema
 }).strict();
 
 const deleteUserSchema = z.object({
   id: z.coerce.number().describe("User ID"),
   force: z.boolean().optional().describe("Whether to bypass trash and force deletion"),
-  reassign: z.coerce.number().optional().describe("User ID to reassign posts to")
+  reassign: z.coerce.number().optional().describe("User ID to reassign posts to"),
+  site_id: siteIdSchema
 }).strict();
 
 type ListUsersParams = z.infer<typeof listUsersSchema>;
@@ -94,7 +101,8 @@ export const userTools: Tool[] = [
 export const userHandlers = {
   list_users: async (params: ListUsersParams) => {
     try {
-      const response = await makeWordPressRequest('GET', "users", params);
+      const { site_id, ...query } = params;
+      const response = await makeWordPressRequest('GET', "users", query, { siteId: site_id });
       const users: WPUser[] = response;
       return {
         toolResult: {
@@ -113,7 +121,7 @@ export const userHandlers = {
   },
   get_user: async (params: GetUserParams) => {
     try {
-      const response = await makeWordPressRequest('GET', `users/${params.id}`, { context: params.context });
+      const response = await makeWordPressRequest('GET', `users/${params.id}`, { context: params.context }, { siteId: params.site_id });
       const user: WPUser = response;
       return {
         toolResult: {
@@ -132,7 +140,8 @@ export const userHandlers = {
   },
   create_user: async (params: CreateUserParams) => {
     try {
-      const response = await makeWordPressRequest('POST', "users", params);
+      const { site_id, ...userData } = params;
+      const response = await makeWordPressRequest('POST', "users", userData, { siteId: site_id });
       const user: WPUser = response;
       return {
         toolResult: {
@@ -151,8 +160,8 @@ export const userHandlers = {
   },
   update_user: async (params: UpdateUserParams) => {
     try {
-      const { id, ...updateData } = params;
-      const response = await makeWordPressRequest('POST', `users/${id}`, updateData);
+      const { id, site_id, ...updateData } = params;
+      const response = await makeWordPressRequest('POST', `users/${id}`, updateData, { siteId: site_id });
       const user: WPUser = response;
       return {
         toolResult: {
@@ -174,7 +183,7 @@ export const userHandlers = {
       const response = await makeWordPressRequest('DELETE', `users/${params.id}`, { 
         force: params.force,
         reassign: params.reassign
-      });
+      }, { siteId: params.site_id });
       const user: WPUser = response;
       return {
         toolResult: {

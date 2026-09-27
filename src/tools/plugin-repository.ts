@@ -1,6 +1,7 @@
 // src/tools/plugin-repository.ts
 import { Tool } from '@modelcontextprotocol/sdk/types.js';
 import { userAgentHeader } from '../config/user-agent.js';
+import { getRequestTimeoutMs } from '../config/site-manager.js';
 import { searchWordPressPluginRepository } from '../wordpress.js';
 import { z } from 'zod';
 import { zodToJsonSchema } from 'zod-to-json-schema';
@@ -118,6 +119,7 @@ export const pluginRepositoryHandlers = {
       // Use axios directly for this specific request
       const axios = (await import('axios')).default;
       const response = await axios.post(apiUrl, requestData, {
+        timeout: getRequestTimeoutMs(),
         headers: {
           'Content-Type': 'application/json',
           ...userAgentHeader()

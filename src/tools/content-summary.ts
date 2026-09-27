@@ -2,7 +2,9 @@
 import { Tool } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
 import { makeWordPressRequest } from '../wordpress.js';
-import { findContentByUrl, getContentEndpoint } from './unified-content.js';
+import { siteManager } from '../config/site-manager.js';
+import { resolveContentEndpoint } from '../content/content-types.js';
+import { findContentByUrl, resolveSiteForContentUrl } from './unified-content.js';
 
 const getContentSummarySchema = z.object({
   id: z.coerce.number().optional().describe(
@@ -125,10 +127,25 @@ export const contentSummaryHandlers = {
       }
 
       let contentType = params.content_type ?? 'post';
+      let siteId = params.site_id;
+      let siteWarning: string | undefined;
       let id: number;
 
       if (hasUrl) {
-        const ref = await findContentByUrl(params.url!, params.site_id);
+        // Pick (or check) the site from the URL host so a staging URL is not
+        // looked up by slug on the default production site.
+        const siteResolution = resolveSiteForContentUrl(
+          params.url!,
+          params.site_id ? siteManager.resolveSiteId(params.site_id) : undefined,
+          siteManager.getAllSites()
+        );
+        if (!siteResolution.ok) {
+          throw new Error(siteResolution.error);
+        }
+        siteId = siteResolution.siteId;
+        siteWarning = siteResolution.warning;
+
+        const ref = await findContentByUrl(params.url!, siteId);
         if (!ref) {
           throw new Error(`No content found with URL: ${params.url}`);
         }
@@ -138,13 +155,13 @@ export const contentSummaryHandlers = {
         id = params.id!;
       }
 
-      const endpoint = await getContentEndpoint(contentType, params.site_id);
+      const endpoint = await resolveContentEndpoint(contentType, siteId);
       // Bypass response trimming so yoast_head_json reaches us — the trim
       // documented in PR #16 strips it from every response by default, with
       // `rawResponse: true` as the documented escape hatch for callers that
       // need it.
       const raw = await makeWordPressRequest('GET', `${endpoint}/${id}`, undefined, {
-        siteId: params.site_id,
+        siteId,
         rawResponse: true
       });
 
@@ -154,7 +171,7 @@ export const contentSummaryHandlers = {
         toolResult: {
           content: [{
             type: 'text',
-            text: JSON.stringify(summary, null, 2)
+            text: JSON.stringify(siteWarning ? { ...summary, warnings: [siteWarning] } : summary, null, 2)
           }],
           isError: false
         }

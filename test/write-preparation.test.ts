@@ -44,7 +44,7 @@ const contractResolution: ContractResolution = {
   }
 };
 
-test('delete requests for contract-backed EventON events include item fallback endpoint', () => {
+test('delete requests for contract-backed EventON events route to APIfy with a wp/v2 fallback', () => {
   const prepared = buildContentDeleteRequest({
     contentType: 'ajde_events',
     id: 123,
@@ -52,11 +52,12 @@ test('delete requests for contract-backed EventON events include item fallback e
     contractResolution
   });
 
-  assert.equal(prepared.endpoint, 'ajde_events/123');
-  assert.equal(prepared.namespace, 'wp/v2');
+  assert.equal(prepared.endpoint, 'events/123');
+  assert.equal(prepared.namespace, 'eventonapify/v1');
   assert.deepEqual(prepared.fallbackOn404, {
-    endpoint: 'events/123',
-    namespace: 'eventonapify/v1'
+    endpoint: 'ajde_events/123',
+    namespace: 'wp/v2',
+    data: { force: true }
   });
-  assert.deepEqual(prepared.data, { force: true });
+  assert.deepEqual(prepared.data, {});
 });

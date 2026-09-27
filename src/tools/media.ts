@@ -1,12 +1,12 @@
 // src/tools/media.ts
-import axios from 'axios';
 import FormData from 'form-data';
-import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { Tool } from '@modelcontextprotocol/sdk/types.js';
 import { makeWordPressRequest } from '../wordpress.js';
 import { userAgentHeader } from '../config/user-agent.js';
 import { WPMedia } from '../types/wordpress-types.js';
+import { guardedFetch } from '../security/url-guard.js';
+import { readAllowedUploadFile } from '../security/upload-path-guard.js';
 import { z } from 'zod';
 
 const mediaContextSchema = z.enum(['view', 'embed', 'edit']);
@@ -54,7 +54,7 @@ const createMediaSchema = z.object({
   description: z.string().optional().describe("Description of the media"),
   post: z.coerce.number().optional().describe("Associated post ID"),
   source_url: z.string().optional().describe("Remote HTTP(S) URL of the media file"),
-  file_path: z.string().optional().describe("Local file path to upload. Relative paths are resolved from the server working directory.")
+  file_path: z.string().optional().describe("Local file path to upload. Must be inside a directory listed in WORDPRESS_MEDIA_UPLOAD_DIRS (disabled when unset). Relative paths are resolved from the server working directory.")
 }).strict();
 
 const updateMediaSchema = z.object({
@@ -182,9 +182,15 @@ function buildUploadFilename(originalFilename: string, explicitTitle?: string) {
     return originalFilename;
   }
 
+  // Never let the caller-supplied title supply the extension: an extensionless source
+  // keeps its original name so WordPress's file-type check sees the real filename.
   const extension = path.extname(originalFilename);
+  if (!extension) {
+    return originalFilename;
+  }
+
   const sanitizedTitle = sanitizeFilenamePart(explicitTitle);
-  return extension ? `${sanitizedTitle}${extension}` : sanitizedTitle;
+  return `${sanitizedTitle}${extension}`;
 }
 
 function normalizeMimeType(contentTypeHeader?: unknown) {
@@ -193,15 +199,6 @@ function normalizeMimeType(contentTypeHeader?: unknown) {
   }
 
   return contentTypeHeader.split(';')[0].trim() || 'application/octet-stream';
-}
-
-function isHttpUrl(value: string) {
-  try {
-    const url = new URL(value);
-    return url.protocol === 'http:' || url.protocol === 'https:';
-  } catch {
-    return false;
-  }
 }
 
 function deriveFilenameFromUrl(sourceUrl: string, mimeType: string) {
@@ -221,26 +218,11 @@ function deriveFilenameFromUrl(sourceUrl: string, mimeType: string) {
 }
 
 async function loadUploadFromFilePath(filePath: string, explicitTitle?: string): Promise<UploadSource> {
-  const resolvedPath = path.resolve(process.cwd(), filePath);
+  const { realPath, buffer } = await readAllowedUploadFile(filePath);
 
-  let fileStats;
-  try {
-    fileStats = await fs.stat(resolvedPath);
-  } catch (error: any) {
-    if (error.code === 'ENOENT') {
-      throw new Error(`File not found: ${filePath}`);
-    }
-    throw new Error(`Unable to access file_path '${filePath}': ${error.message}`);
-  }
-
-  if (!fileStats.isFile()) {
-    throw new Error(`Path is not a file: ${filePath}`);
-  }
-
-  const originalFilename = path.basename(resolvedPath);
+  const originalFilename = path.basename(realPath);
   const filename = buildUploadFilename(originalFilename, explicitTitle);
   const mimeType = inferMimeType(originalFilename);
-  const buffer = await fs.readFile(resolvedPath);
 
   return {
     buffer,
@@ -251,12 +233,7 @@ async function loadUploadFromFilePath(filePath: string, explicitTitle?: string):
 }
 
 async function loadUploadFromUrl(sourceUrl: string, explicitTitle?: string): Promise<UploadSource> {
-  if (!isHttpUrl(sourceUrl)) {
-    throw new Error('source_url must be an absolute http or https URL');
-  }
-
-  const response = await axios.get<ArrayBuffer>(sourceUrl, {
-    responseType: 'arraybuffer',
+  const response = await guardedFetch(sourceUrl, {
     headers: userAgentHeader()
   });
   const contentTypeHeader = response.headers['content-type'];

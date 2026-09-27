@@ -8,6 +8,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { allTools, toolHandlers } from './tools/index.js';
 import { z } from 'zod';
 import { normalizeToolResult } from './mcp/tool-results.js';
+import { buildToolInputSchema } from './mcp/input-schema.js';
 
 
 // Create MCP server instance.
@@ -38,12 +39,15 @@ for (const tool of allTools) {
     // Tool modules define inputSchema.properties as zod shapes (see CLAUDE.md);
     // passing raw JSON Schema here collapses the published schema to {}.
     const rawShape = tool.inputSchema.properties as z.ZodRawShape;
+    // Register a full zod object so unknown keys are rejected (strict) or
+    // forwarded (passthrough tools) instead of silently stripped by the SDK.
     // Cast bypasses TS2589: server.tool's generic resolves ShapeOutput<Args>
     // against the SDK's z3|z4 union schema type, exploding instantiation depth.
+    const inputSchema = buildToolInputSchema(tool.name, rawShape);
     server.registerTool(tool.name, {
         title: tool.title,
         description: tool.description ?? '',
-        inputSchema: rawShape,
+        inputSchema,
         outputSchema: z.object({
             data: z.unknown().optional(),
             error: z.object({ message: z.string() }).optional()

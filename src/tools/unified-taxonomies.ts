@@ -1,7 +1,7 @@
 // src/tools/unified-taxonomies.ts
 import { Tool } from '@modelcontextprotocol/sdk/types.js';
 import { makeWordPressRequest, logToFile } from '../wordpress.js';
-import { getContentEndpoint } from './unified-content.js';
+import { resolveContentEndpoint } from '../content/content-types.js';
 import { z } from 'zod';
 import { prepareGetContentRequest } from '../content/read-preparation.js';
 import {
@@ -423,7 +423,7 @@ export const unifiedTaxonomyHandlers = {
       // unknown field is silently ignored by WordPress, so resolving here is
       // what makes the write actually land.
       const { slug, restBase } = await resolveTaxonomy(params.taxonomy, params.site_id);
-      const contentEndpoint = await getContentEndpoint(params.content_type, params.site_id);
+      const contentEndpoint = await resolveContentEndpoint(params.content_type, params.site_id);
 
       let termsToAssign = [...params.terms];
 
