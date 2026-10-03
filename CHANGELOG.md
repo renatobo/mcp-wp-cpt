@@ -7,7 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-10-03
+
 ### Security
+- **Refreshed transitive dependencies to clear `npm audit`.** Runtime deps of
+  `@modelcontextprotocol/sdk`: `hono` 4.13.12, `qs` 6.16.0, `ip-address` 10.7.3 and `fast-uri` 3.1.8
+  (moderate advisories including GHSA-g6gw-c38x-mqfc, GHSA-x5fp-wj9c-mxmx, GHSA-rpw4-54j3-4h4q and
+  GHSA-hrr3-gc8f-f4qj), plus dev-only `brace-expansion` 5.0.12 (high, GHSA-q2hr-2g5m-vwhr). Lockfile
+  only, no direct dependency ranges changed.
 - **`content_type` can no longer redirect authenticated requests.** Content type identifiers must
   match `[A-Za-z0-9_-]+`, endpoints with `://`, a leading `//`, backslashes, or `.`/`..` segments are
   refused, and the per-site axios client sets `allowAbsoluteUrls: false`. Before, a value such as
