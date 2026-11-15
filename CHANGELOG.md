@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Update all direct dependencies to their latest releases, including dotenv 18,
+  Vitest 5, and Node.js 26 type definitions; refresh the dependency lockfile.
+
+### Security
+- Upgrade the `follow-redirects` override to 1.16.3 and refresh transitive
+  dependencies, clearing all 11 reported npm audit findings.
+
 ## [0.2.2] - 2026-10-03
 
 ### Security
